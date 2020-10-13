@@ -1,0 +1,2190 @@
+import sat, util.
+
+/****************************************************************************
+    xcsp.pi, Neng-Fa Zhou, 2018, 2019.
+    
+    Thanks to Hakan Kjellerstrand for testing this interpreter, to Christophe Lecoutre
+    and Olivier Roussel for many clarifications about the XCSP specification.
+
+    This is an interpreter for the XCSP language (www.xcsp.org) written in Picat (picat-lang.org).
+    This program assumes correct syntax, and thus does not detect syntax errors. Also, it assumes
+    that no operators or keywords are used as identifiers.
+
+    Given an XCSP instance, say "nqueens_8.xml", this program can be run as follows:
+   
+    Picat> cl("xcsp")
+    Picat> main("nqueens_8")
+
+    Alternatively, this program can be run as a standalone command:
+
+    picat xcsp nqueens_8
+/*********************************************************************/
+
+main(InFile),string(InFile) =>
+    xcsp2picat(InFile).    
+main([InFile]),string(InFile) =>
+    xcsp2picat(InFile).
+main(Args) =>
+    throw($invalid_args(Args)).           
+
+xcsp2picat(InFile) =>
+    (append(MainFileStr,".xml",InFile) -> 
+        CSPFile = InFile
+    ; 
+        MainFileStr = InFile,
+        CSPFile = InFile ++ ".xml"
+    ),        
+    println("c xcsp_picat version 2.8#11 (6/6/2020)"),
+%    printf("c converting %s\n",CSPFile),
+    bp.c_set_eolcom_flag(0),                           % treat % as a token
+    InStream = open(CSPFile,read),
+    catch(parse_xcsp_xml(InStream),Exception,(printf("c exception occurred %w\n",Exception), halt)),
+    close(InStream),
+    bp.c_set_eolcom_flag(1).
+
+parse_xcsp_xml(InStream) ?=>
+    VarMap = new_map(),
+    read_next_key_token(InStream,Token),
+    once(parse_sections(InStream,Token,VarMap,Objs)),
+    (var(Objs) -> Objs = []; true),
+    AllVars = vars([Val : (_Key=Val) in VarMap]),
+    DVars = [Var : Var in AllVars, dvar(Var)],
+%    println("c conversion successful!"),!,
+%    writeln($solve_xcsp(Objs,DVars)),
+    solve_xcsp(Objs,DVars,VarMap).
+parse_xcsp_xml(_InStream) =>
+    println("c failed before solving."),
+    println("s UNSATISFIABLE").
+
+%%%
+solve_xcsp([],Vars,VarMap) =>
+    (solve(Vars) ->
+        println("s SATISFIABLE"),
+        output_sol(VarMap)
+    ;
+        println("s UNSATISFIABLE")
+    ).
+solve_xcsp(Objs@[min(Var)],Vars,VarMap) =>
+    (solve($[report(printf("o %w\n",Var))|Objs],Vars) ->
+        println("s OPTIMUM FOUND"),
+        output_sol(VarMap)
+    ;
+        println("s UNSATISFIABLE")
+    ).
+solve_xcsp(Objs@[max(Var)],Vars,VarMap) =>
+    (solve($[report(printf("o %w\n",Var))|Objs],Vars) ->
+        println("s OPTIMUM FOUND"),
+        output_sol(VarMap)
+    ;
+        println("s UNSATISFIABLE")
+    ).
+solve_xcsp(Objs,_Vars,_VarMap) =>
+    printf("c multi-objective optimization unsupported %w\n",Objs).
+
+%%%
+output_sol(VarMap) =>
+    println("v <instantiation>"),
+    List = map_to_list(VarMap),
+    print("v     <list> "),    
+    foreach ((Key=Val) in List)
+        print(Key),
+        output_subscripts(Val),
+        print(" ")
+    end,
+    println(" </list> "),
+    print("v     <values> "),    
+    foreach ((_Key=Val) in List)
+        output_val(Val),
+        print(" ")
+    end,
+    println(" </values> "),
+    println("v </instantiation>").
+
+output_subscripts(Arr),compound(Arr) =>
+    print("[]"),
+    output_subscripts(Arr[1]).
+output_subscripts(_Arr) => true.
+
+output_val(T), compound(T) =>
+    foreach (I in 1..len(T))
+        output_val(T[I])
+    end.
+output_val(T), integer(T) =>
+    print(T), print(" ").
+output_val(_T) =>
+    print('*'), print(" ").    
+
+%%%
+
+/*
+parse_sections(_InStream,KeyToken,_VarMap,_Objs) ?=>
+    writeln(KeyToken),
+    fail.
+*/
+parse_sections(_InStream,end_of_file,_VarMap,_Objs) => true.  
+parse_sections(InStream,variables,VarMap,Objs) =>
+    read_next_key_token(InStream,KeyToken),
+    parse_variables(InStream,KeyToken,VarMap,Objs).
+parse_sections(InStream,constraints,VarMap,Objs) =>
+    read_next_key_token(InStream,KeyToken),
+    parse_constrs(InStream,KeyToken,VarMap),
+    read_next_key_token(InStream,KeyToken2),
+    parse_sections(InStream,KeyToken2,VarMap,Objs).
+parse_sections(InStream,objectives,VarMap,Objs) =>
+    read_next_key_token(InStream,KeyToken),
+    parse_objectives(InStream,KeyToken,VarMap,Objs).
+parse_sections(_InStream,_,_VarMap,_Objs) =>
+    true.
+
+%%%
+parse_variables(InStream,var,VarMap,Objs) =>           % <var id = Name .../>
+    read_picat_token(InStream,_,Attr),
+    parse_var_attrs(InStream,Attr,_VarName,_Alias,VarMap),
+    read_next_key_token(InStream,NextKeyToken),
+    parse_variables(InStream,NextKeyToken,VarMap,Objs).
+parse_variables(InStream,array,VarMap,Objs) =>         % <array id = Name .../>
+    read_picat_token(InStream,_,Attr),
+    parse_arr_attrs(InStream,Attr,_ArrName,_Alias,_Dims,_Arr,VarMap),
+    read_next_key_token(InStream,NextKeyToken),
+    parse_variables(InStream,NextKeyToken,VarMap,Objs).
+parse_variables(InStream,KeyToken,VarMap,Objs) =>
+    parse_sections(InStream,KeyToken,VarMap,Objs).
+
+%%%% (id = ArrName | as = Alias | size = Size)*
+parse_arr_attrs(InStream,id,ArrName,Alias,Dims,Arr,VarMap) =>
+    read_picat_token(InStream,_,_),                    % =
+    read_picat_token(InStream,_,ArrNameStr),
+    ArrName = to_atom(ArrNameStr),
+    read_picat_token(InStream,_,NextAttr),
+    parse_arr_attrs(InStream,NextAttr,ArrName,Alias,Dims,Arr,VarMap).
+parse_arr_attrs(InStream,as,ArrName,Alias,Dims,Arr,VarMap) =>
+    read_picat_token(InStream,_,_),                    % =    
+    read_picat_token(InStream,_,AliasStr),
+    Alias = to_atom(AliasStr),
+    read_picat_token(InStream,_,NextAttr),
+    parse_arr_attrs(InStream,NextAttr,ArrName,Alias,Dims,Arr,VarMap).
+parse_arr_attrs(InStream,size,ArrName,Alias,Dims,Arr,VarMap) =>
+    read_picat_token(InStream,_,_),                    % =
+    read_picat_token(InStream,_,DimStr),               % "[D1][D2]...[Dn]"
+    DimTokens = split(DimStr,"[] \t\r\n"),             % ["D1","D2",...,"Dn"]
+    Dims = [to_int(DimToken) : DimToken in DimTokens],
+    Arr = construct_array(Dims),
+    read_picat_token(InStream,_,NextAttr),
+    parse_arr_attrs(InStream,NextAttr,ArrName,Alias,Dims,Arr,VarMap).
+parse_arr_attrs(_InStream,'/>',ArrName,Alias,Dims,Arr,VarMap) =>   % nonvar(Alias) must be true
+    AliasArr = VarMap.get(Alias),
+    (var(Arr) ->
+        get_array_dims(AliasArr,Dims),
+        Arr = construct_array(Dims)
+    ;
+        true
+    ),
+    same_array_domains(Arr,AliasArr),
+    VarMap.put(ArrName,Arr).
+parse_arr_attrs(InStream,'>',ArrName,_Alias,Dims,Arr,VarMap) =>   % var(Alias) is true
+    VarMap.put(ArrName,Arr),
+    read_picat_token(InStream,_,Token1),
+    (start_int(Token1) ->
+        parse_intExps(InStream,Token1,VarMap,Dom,Dom),
+        bp.'::'(vars(Arr),Dom),                          %  Arr :: Dom,
+        skip_until_1(InStream,'>')                     % skip until array>
+    ;
+        read_picat_token(InStream,_,NextKeyToken),     % NextKeyToken = domain
+        parse_arr_mixed_doms(InStream,Dims,Arr,NextKeyToken,VarMap)
+    ).
+parse_arr_attrs(InStream,_Attr,ArrName,Alias,Dims,Arr,VarMap) =>   % ignore this attr
+    read_picat_token(InStream,_,_),                    % =    
+    read_picat_token(InStream,_,_),
+    read_picat_token(InStream,_,NextAttr),
+    parse_arr_attrs(InStream,NextAttr,ArrName,Alias,Dims,Arr,VarMap).
+
+/*
+parse_arr_mixed_doms(InStream,Dims,Arr,KeyToken,VarMap) ?=>
+    writeln($parse_arr_mixed_doms(InStream,Dims,KeyToken,VarMap)),fail.
+*/
+parse_arr_mixed_doms(InStream,Dims,Arr,domain,VarMap) =>
+    read_picat_token(InStream,_,_T1),                  % for
+    read_picat_token(InStream,_,_T2),                  % =
+    read_picat_token(InStream,_,SubscriptsStr),        % like "z [][0..1][] z [][2][2..4] "
+%    writeln((_T1,_T2,SubscriptsStr)),
+    my_split(SubscriptsStr,SubscriptsTokens),          % similar to split, but keeps "[" and "]" as tokens
+    skip_until_1(InStream,'>'),
+    read_picat_token(InStream,_,NextToken),
+    parse_intExps(InStream,NextToken,VarMap,Dom,Dom),
+    parse_arr_domain_subscripts(Dims,Arr,SubscriptsTokens,Dom),
+    skip_until_1(InStream,'>'),                        % skip </ domain>    
+    read_next_key_token(InStream,NextKeyToken),        % domain declarations
+    parse_arr_mixed_doms(InStream,Dims,Arr,NextKeyToken,VarMap).
+parse_arr_mixed_doms(InStream,_Dims,_Arr,_KeyToken,_VarMap) =>
+    skip_until_1(InStream,'>').                        % skip </ array>    
+
+parse_arr_domain_subscripts(_Dims,_Arr,[],_Dom) => true.
+parse_arr_domain_subscripts(Dims,Arr,["others"],Dom) =>
+    dom_constr_others(Dims,Arr,Dom).
+parse_arr_domain_subscripts(Dims,Arr,[_ArrNameStr|Tokens],Dom) =>
+    extract_subscripts(Dims,Tokens,TokensR,Ranges),
+    dom_constr_subarray(Ranges,Arr,Dom),
+    parse_arr_domain_subscripts(Dims,Arr,TokensR,Dom).
+
+/*
+extract_subscripts(_,Tokens,TokensR,Ranges) ?=>
+    writeln($extract_subscripts(_,Tokens,TokensR,Ranges)),fail.
+*/
+extract_subscripts([],Tokens,TokensR,Ranges) =>
+    Tokens = TokensR,
+    Ranges = [].
+extract_subscripts([Dim|Dims],["[","]"|Tokens],TokensR,Ranges) =>
+    Ranges = [(1,Dim)|RangesR],
+    extract_subscripts(Dims,Tokens,TokensR,RangesR).
+extract_subscripts([_Dim|Dims],["[",FromToken,"..",ToToken,_RBracketToken|Tokens],TokensR,Ranges) =>    % [From..To]
+    From = to_int(FromToken)+1,                                % array indices are 1-based in Picat
+    To = to_int(ToToken)+1,
+    Ranges = [(From,To)|RangesR],
+    extract_subscripts(Dims,Tokens,TokensR,RangesR).
+extract_subscripts([_Dim|Dims],["[",IndexToken,_RBracketToken|Tokens],TokensR,Ranges) =>    % [I]
+    Index = to_int(IndexToken)+1,
+    Ranges = [(Index,Index)|RangesR],
+    extract_subscripts(Dims,Tokens,TokensR,RangesR).    
+
+dom_constr_others([],Var,_Dom), dvar_or_int(Var) => true.
+dom_constr_others([],Var,Dom) =>   % Var is a plain variable
+    bp.'::'(Var,Dom).
+dom_constr_others([Dim|Dims],Arr,Dom) =>
+    foreach (I in 1..Dim)
+        dom_constr_others(Dims,Arr[I],Dom)
+    end.
+
+dom_constr_subarray([],Var,Dom) => Var :: Dom.
+dom_constr_subarray([(From,To)|Ranges],Arr,Dom) =>
+    foreach (I in From..To)
+        dom_constr_subarray(Ranges,Arr[I],Dom)
+    end.
+
+%%%% (id = VarName | as = Alias | type = _)+
+parse_var_attrs(InStream,id,VarName,Alias,VarMap) =>
+    read_picat_token(InStream,_,_),                    % =
+    read_picat_token(InStream,_,VarNameStr),
+    VarName = to_atom(VarNameStr),
+    read_picat_token(InStream,_,NextAttr),
+    parse_var_attrs(InStream,NextAttr,VarName,Alias,VarMap).
+parse_var_attrs(InStream,as,VarName,Alias,VarMap) =>    
+    read_picat_token(InStream,_,_),                    % =    
+    read_picat_token(InStream,_,AliasStr),
+    Alias = to_atom(AliasStr),
+    read_picat_token(InStream,_,NextAttr),
+    parse_var_attrs(InStream,NextAttr,VarName,Alias,VarMap).
+parse_var_attrs(_InStream,'/>',VarName,Alias,VarMap) =>  % </variable>, Alias must be nonvar
+    DVar0 = VarMap.get(Alias),
+    same_domains(DVar,DVar0),
+    VarMap.put(VarName,DVar).
+parse_var_attrs(InStream,'>',VarName,_Alias,VarMap) => % Alias must be var
+    read_picat_token(InStream,_,Token),
+    parse_intExps(InStream,Token,VarMap,Dom,Dom),
+    DVar :: Dom,
+    VarMap.put(VarName,DVar),
+    skip_until_1(InStream,'>').
+parse_var_attrs(InStream,_Attr,VarName,Alias,VarMap) => % ignore this attr
+    read_picat_token(InStream,_,_),        % =    
+    read_picat_token(InStream,_,_),
+    read_picat_token(InStream,_,NextAttr),
+    parse_var_attrs(InStream,NextAttr,VarName,Alias,VarMap).
+
+%%%%
+/*
+parse_constrs(_InStream,Token,_VarMap) ?=>
+    writeln($parse_constrs(Token)),fail.
+*/
+parse_constrs(InStream,constraints,_VarMap) =>
+    skip_until_1(InStream,'>').                        % skip until after </constraints>
+parse_constrs(InStream,slide,VarMap) =>
+    read_picat_token(InStream,_,Token),
+    parse_slide_circular(InStream,Token,Circular),
+    parse_slide(InStream,VarMap,Circular),
+    read_next_key_token(InStream,NextKeyToken),
+    parse_constrs(InStream,NextKeyToken,VarMap).
+parse_constrs(InStream,group,VarMap) =>
+    skip_until_1(InStream,'>'),                        % skip until after group>
+    read_next_key_token(InStream,KeyToken1),
+    parse_constr(InStream,KeyToken1,VarMap,Constr),
+    read_next_key_token(InStream,KeyToken2),    
+    parse_group_args(InStream,KeyToken2,VarMap,Constr),
+    skip_until_1(InStream,'>'),                        % skip until after </group>
+    read_next_key_token(InStream,KeyToken3),
+    parse_constrs(InStream,KeyToken3,VarMap).
+parse_constrs(InStream,block,VarMap) =>                % blocks are ignored
+    skip_until_1(InStream,'>'),
+    read_next_key_token(InStream,KeyToken),
+    parse_constrs(InStream,KeyToken,VarMap).
+parse_constrs(InStream,Token,VarMap) =>
+    parse_constr(InStream,Token,VarMap,Constr),
+    post_constr(Constr),
+    read_next_key_token(InStream,KeyToken),
+    parse_constrs(InStream,KeyToken,VarMap).
+    
+parse_constr(InStream,extension,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after extension>
+    parse_extension_constr(InStream,VarMap,Constr).
+parse_constr(InStream,intension,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after intension>
+    read_picat_token(InStream,_,Token),
+    parse_intension_constr(InStream,Token,VarMap,Constr).
+parse_constr(InStream,regular,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after regular>
+    parse_regular_constr(InStream,VarMap,Constr).
+parse_constr(InStream,grammar,_VarMap,Constr) =>
+    printf(stderr,"c unknown constraint %w\n",grammar),
+    Constr = (1 #= 1),
+    skip_until_2(InStream,'</',grammar),
+    skip_until_1(InStream,'>').                      
+parse_constr(InStream,mdd,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after regular>
+    parse_mdd_constr(InStream,VarMap,Constr).
+parse_constr(InStream,allDifferent,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after allDifferent>
+    read_picat_token(InStream,_,Token),
+    parse_allDifferent_constr(InStream,Token,VarMap,Constr).
+parse_constr(InStream,allEqual,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after allEqual>
+    read_picat_token(InStream,_,Token),
+    parse_allEqual_constr(InStream,Token,VarMap,Constr).
+parse_constr(InStream,allDistant,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after allDistant>
+    read_picat_token(InStream,_,Token),
+    parse_allDistant_constr(InStream,Token,VarMap,Constr).
+parse_constr(InStream,ordered,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after allEqual>
+    read_picat_token(InStream,_,Token),
+    parse_ordered_constr(InStream,Token,VarMap,Constr).
+parse_constr(InStream,cardinality,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after cardinality>
+    parse_cardinality_constr(InStream,VarMap,Constr).
+parse_constr(InStream,maximum,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after maximum>
+    read_picat_token(InStream,_,Token),
+    parse_minmax_constr(InStream,Token,VarMap,max,Constr).
+parse_constr(InStream,minimum,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after minimum>
+    read_picat_token(InStream,_,Token),
+    parse_minmax_constr(InStream,Token,VarMap,min,Constr).
+parse_constr(InStream,sum,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after sum>
+    read_picat_token(InStream,_,Token),
+    parse_sum_constr(InStream,Token,VarMap,Constr).
+parse_constr(InStream,count,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after count>
+    read_picat_token(InStream,_,Token),
+    parse_count_constr(InStream,Token,VarMap,Constr).
+parse_constr(InStream,nValues,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after nValues>
+    read_picat_token(InStream,_,Token),
+    parse_nValues_constr(InStream,Token,VarMap,Constr).
+parse_constr(InStream,element,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after element>
+    read_picat_token(InStream,_,Token),
+    parse_element_constr(InStream,Token,VarMap,Constr).
+parse_constr(InStream,channel,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after channel>
+    read_picat_token(InStream,_,Token),
+    parse_channel_constr(InStream,Token,VarMap,Constr).
+parse_constr(InStream,noOverlap,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after noOverlap>
+    parse_noOverlap_constr(InStream,VarMap,Constr).
+parse_constr(InStream,cumulative,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after cumulative>
+    parse_cumulative_constr(InStream,VarMap,Constr).
+parse_constr(InStream,lex,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after allEqual>
+    read_picat_token(InStream,_,Token),
+    parse_lex_constr(InStream,Token,VarMap,Constr).
+parse_constr(InStream,circuit,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after circuit>
+    read_picat_token(InStream,_,Token),
+    parse_circuit_constr(InStream,Token,VarMap,Constr).
+parse_constr(InStream,instantiation,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after instantiation>
+    read_picat_token(InStream,_,Token),
+    parse_instantiation_constr(InStream,Token,VarMap,Constr).
+
+%%%
+/*
+parse_group_args(InStream,Token,VarMap,Constr) ?=>
+    writeln($parse_group_args(InStream,Token,VarMap,Constr)),fail.
+*/
+parse_group_args(InStream,args,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after <args>
+    read_picat_token(InStream,_,Token),
+    parse_list(InStream,Token,VarMap,Args,Args),
+    substitute_constr_args(Constr,Args,Constr1),
+    post_constr(Constr1),
+    read_next_key_token(InStream,KeyToken),    
+    parse_group_args(InStream,KeyToken,VarMap,Constr).
+parse_group_args(_InStream,_Token,_VarMap,_Constr) =>  % _Token == group
+    true.
+    
+%%%
+parse_extension_constr(InStream,VarMap,Constr) =>  
+    skip_until_1(InStream,'>'),                       % skip until after <list>    
+    read_picat_token(InStream,_,Token),
+    parse_list(InStream,Token,VarMap,Args,Args),
+    read_picat_token(InStream,_,_),                   % <conflicts> or <supports>
+    read_picat_token(InStream,_,Type),                
+    read_picat_token(InStream,_,_),
+    read_picat_token(InStream,_,Token2),    
+    parse_tuples(InStream,Token2,VarMap,Tuples,HasStar),
+    skip_until_1(InStream,'>'),                       % skip until after </conflicts> or </supports>
+    skip_until_1(InStream,'>'),                       % skip until after </extension>
+    (Args == params -> Scope = params; Scope = to_array(Args)),
+    Constr = $table(Type,Scope,Tuples,HasStar).
+    
+parse_list(InStream,Token,VarMap,Elms0,Elms) =>       % </list> or </args> ...
+    parse_intExps(InStream,Token,VarMap,Elms0,Elms),
+    skip_until_1(InStream,'>').                       % skip until after </list>    
+    
+%%%
+% for parsing (1) list elements: <list> a b x[] </list>;
+%             (2) domain items: <var..> 1 3..4 </var>
+%             (3) unary tables: <supports > 1 2 4 8..10 </ supports >
+%             (4) cardinatility constraints: <occurs> 1 1..2 </occurs>
+
+/*
+parse_intExps(InStream,Token,VarMap,Elms0,Elms) ?=>
+   writeln($intExps(Token)),fail.
+*/
+parse_intExps(_InStream,'</',_VarMap,Elms0,Elms) =>
+    (Elms0 == params ->
+        true
+    ;
+        Elms = []
+    ).
+parse_intExps(InStream,'%',VarMap,Elms0,Elms) =>
+    read_picat_token(InStream,_,Token),
+    (Token == '...' ->                                 % %...
+        Elms0 = params
+    ;
+        Index = Token+1,
+        Elms = [$param(Index)|Elms1]                   % %1 %2 ...
+    ),
+    read_picat_token(InStream,_,NextToken),
+    parse_intExps(InStream,NextToken,VarMap,Elms0,Elms1).
+parse_intExps(InStream,Token,VarMap,Elms0,Elms), xcsp_start_intExp(Token) =>
+    parse_intExp(InStream,Token,VarMap,E1),
+    read_picat_token(InStream,_,Token2),    
+    (int(E1), Token2 == '..' ->
+        read_picat_token(InStream,_,Token3),
+        parse_intExp(InStream,Token3,VarMap,E2),
+        read_picat_token(InStream,_,NextToken),            
+        construct_range(E1,E2,E)
+    ;
+        E = E1,
+        NextToken = Token2
+    ),
+    Elms = [E|ElmsR],
+    parse_intExps(InStream,NextToken,VarMap,Elms0,ElmsR).
+parse_intExps(InStream,Token,VarMap,Elms0,Elms) =>     
+    Content = VarMap.get(Token),
+    (compound(Content) ->
+        skip_until_1(InStream,'['),
+        read_picat_token(InStream,_,Token2),
+        parse_indexing_list(InStream,Content,Token2,Elms,ElmsR)
+    ;
+        Elms = [Content|ElmsR]
+    ),
+    read_picat_token(InStream,_,Token3),
+    parse_intExps(InStream,Token3,VarMap,Elms0,ElmsR).
+
+%%% for parsing tables and matrices
+parse_tuples(InStream,'(',VarMap,Tuples,HasStar) =>           % first tuple
+    read_picat_token(InStream,_,Token),    
+    parse_first_tuple(InStream,Token,VarMap,Elms,HasStar),
+    Tuple = to_array(Elms),
+    N = len(Tuple),
+    Tuples = [Tuple|TuplesR],
+    read_picat_token(InStream,_,Token2),    
+    parse_rest_tuples(InStream,N,Token2,VarMap,TuplesR,HasStar).
+parse_tuples(_InStream,'</',_VarMap,Tuples,_HasStar) =>        % empty table
+    Tuples = [].
+parse_tuples(InStream,Token,VarMap,Tuples,_HasStar) =>        % must be a unary table
+    parse_intExps(InStream,Token,VarMap,Tuples,Tuples).       % 1 3..4 5
+
+parse_first_tuple(InStream,'*',VarMap,Elms,HasStar) =>
+    (var(HasStar) -> HasStar = [_]; HasStar = [1]),    % [_] means one star, [1] means at least two stars
+    Elms = ['*'|ElmsR],
+    read_picat_token(InStream,_,Token),
+    parse_first_tuple(InStream,Token,VarMap,ElmsR,HasStar).
+parse_first_tuple(InStream,',',VarMap,Elms,HasStar) =>
+    read_picat_token(InStream,_,Token),
+    parse_first_tuple(InStream,Token,VarMap,Elms,HasStar).
+parse_first_tuple(_InStream,')',_VarMap,Elms,_HasStar) =>
+    Elms = [].
+parse_first_tuple(InStream,Token,VarMap,Elms,HasStar) =>
+    parse_intExp(InStream,Token,VarMap,E),
+    Elms = [E|ElmsR],
+    read_picat_token(InStream,_,NextToken),
+    parse_first_tuple(InStream,NextToken,VarMap,ElmsR,HasStar).
+
+parse_rest_tuples(InStream,N,'(',VarMap,Tuples,HasStar) =>
+    Tuple = new_array(N),
+    read_picat_token(InStream,_,Token),        
+    parse_tuple(InStream,1,Token,VarMap,Tuple,HasStar),
+    Tuples = [Tuple|TuplesR],
+    read_picat_token(InStream,_,NextToken),    
+    parse_rest_tuples(InStream,N,NextToken,VarMap,TuplesR,HasStar).
+parse_rest_tuples(_InStream,_N,_Token,_VarMap,Tuples,_HasStar) =>     % _Token == '<'
+    Tuples = [].
+
+parse_tuple(InStream,I,'*',VarMap,Tuple,HasStar) =>
+    (var(HasStar) -> HasStar = [_]; HasStar = [1]),    % [_] means one star, [1] means at least two stars
+    Tuple[I] = '*',
+    read_picat_token(InStream,_,Token),
+    parse_tuple(InStream,I+1,Token,VarMap,Tuple,HasStar).
+parse_tuple(InStream,I,',',VarMap,Tuple,HasStar) =>
+    read_picat_token(InStream,_,Token),
+    parse_tuple(InStream,I,Token,VarMap,Tuple,HasStar).
+parse_tuple(_InStream,_I,')',_VarMap,_Tuple,_HasStar) =>  true.
+parse_tuple(InStream,I,Token,VarMap,Tuple,HasStar) =>    % Token is a number
+    parse_intExp(InStream,Token,VarMap,E),
+    Tuple[I] = E,
+    read_picat_token(InStream,_,NextToken),
+    parse_tuple(InStream,I+1,NextToken,VarMap,Tuple,HasStar).    
+
+%%%
+% parse_intension_constr(InStream,Token,VarMap,Constr) ?=>  writeln(Token),fail.
+parse_intension_constr(InStream,'<',VarMap,Constr) =>   % <function>
+    skip_until_1(InStream,'>'),                               % skip until after <function>
+    read_picat_token(InStream,_,Token),
+    parse_boolExp(InStream,Token,VarMap,Constr),
+    skip_until_1(InStream,'>'),                               % skip until after </function>
+    skip_until_1(InStream,'>').                               % skip until after </intension>    
+parse_intension_constr(InStream,Token,VarMap,Constr) =>
+    parse_boolExp(InStream,Token,VarMap,Constr),
+    skip_until_1(InStream,'>').                               % skip until after </intension>        
+
+%%%
+parse_boolExp(InStream,lt,VarMap,Exp) =>   % "lt(" intExp "," intExp ")"
+    skip_until_1(InStream,'('),                       
+    read_picat_token(InStream,_,Token1),    
+    parse_intExp(InStream,Token1,VarMap,Exp1),
+    skip_until_1(InStream,','),                       
+    read_picat_token(InStream,_,Token2),    
+    parse_intExp(InStream,Token2,VarMap,Exp2),
+    Exp = (Exp1 #< Exp2),
+    skip_until_1(InStream,')').                       
+parse_boolExp(InStream,le,VarMap,Exp) =>   % "le(" intExp "," intExp ")"
+    skip_until_1(InStream,'('),                       
+    read_picat_token(InStream,_,Token1),    
+    parse_intExp(InStream,Token1,VarMap,Exp1),
+    skip_until_1(InStream,','),                       
+    read_picat_token(InStream,_,Token2),    
+    parse_intExp(InStream,Token2,VarMap,Exp2),
+    Exp = (Exp1 #=< Exp2),
+    skip_until_1(InStream,')').                       
+parse_boolExp(InStream,ge,VarMap,Exp) =>   % "ge(" intExp "," intExp ")"
+    skip_until_1(InStream,'('),                       
+    read_picat_token(InStream,_,Token1),    
+    parse_intExp(InStream,Token1,VarMap,Exp1),
+    skip_until_1(InStream,','),                       
+    read_picat_token(InStream,_,Token2),    
+    parse_intExp(InStream,Token2,VarMap,Exp2),
+    Exp = (Exp1 #>= Exp2),
+    skip_until_1(InStream,')').                       
+parse_boolExp(InStream,gt,VarMap,Exp) =>   % "gt(" intExp "," intExp ")"
+    skip_until_1(InStream,'('),                       
+    read_picat_token(InStream,_,Token1),    
+    parse_intExp(InStream,Token1,VarMap,Exp1),
+    skip_until_1(InStream,','),                       
+    read_picat_token(InStream,_,Token2),    
+    parse_intExp(InStream,Token2,VarMap,Exp2),
+    Exp = (Exp1 #> Exp2),
+    skip_until_1(InStream,')').                       
+parse_boolExp(InStream,ne,VarMap,Exp) =>   % "ne(" intExp "," intExp ")"
+    skip_until_1(InStream,'('),                       
+    read_picat_token(InStream,_,Token1),    
+    parse_intExp(InStream,Token1,VarMap,Exp1),
+    skip_until_1(InStream,','),                       
+    read_picat_token(InStream,_,Token2),    
+    parse_intExp(InStream,Token2,VarMap,Exp2),
+    Exp = (Exp1 #!= Exp2),
+    skip_until_1(InStream,')').                       
+parse_boolExp(InStream,eq,VarMap,Exp) =>   % "eq(" intExp "," ... ")"
+    skip_until_1(InStream,'('),                       
+    read_picat_token(InStream,_,Token1),    
+    parse_intExp(InStream,Token1,VarMap,Exp1),
+    read_picat_token(InStream,_,Token2),
+    parse_intExpsPrime(InStream,Token2,VarMap,Exps),
+    (Exps = [Exp2] ->
+        Exp = $(Exp1 #= Exp2)
+    ;
+        Exp = $eq([Exp1|Exps])
+    ).
+parse_boolExp(InStream,in,VarMap,Exp) =>   % "in(" intExp "," intSet ")"
+    skip_until_1(InStream,'('),                       
+    read_picat_token(InStream,_,Token1),    
+    parse_intExp(InStream,Token1,VarMap,Exp1),
+    skip_until_1(InStream,','),                       
+    read_picat_token(InStream,_,Token2),    
+    parse_intSet(InStream,Token2,VarMap,Exp2),
+    Exp = $(Exp1 :: Exp2),
+    skip_until_1(InStream,')').                       
+parse_boolExp(InStream,not,VarMap,Exp) =>   % "not(" boolExp ")"
+    skip_until_1(InStream,'('),                       
+    read_picat_token(InStream,_,Token1),    
+    parse_boolExp(InStream,Token1,VarMap,Exp1),
+    Exp = (#~ Exp1),
+    skip_until_1(InStream,')').                       
+parse_boolExp(InStream,and,VarMap,Exp) =>   % "and(" boolExp ("," boolExp)+ ")"
+    skip_until_1(InStream,'('),                       
+    read_picat_token(InStream,_,Token1),    
+    parse_boolExp(InStream,Token1,VarMap,Exp1),
+    read_picat_token(InStream,_,Token2),
+    parse_boolExpsPrime(InStream,Token2,VarMap,Exps),
+    Exp = $min([Exp1|Exps]).
+parse_boolExp(InStream,or,VarMap,Exp) =>   % "or(" boolExp ("," boolExp)+ ")"
+    skip_until_1(InStream,'('),                       
+    read_picat_token(InStream,_,Token1),    
+    parse_boolExp(InStream,Token1,VarMap,Exp1),
+    read_picat_token(InStream,_,Token2),
+    parse_boolExpsPrime(InStream,Token2,VarMap,Exps),
+    Exp = $max([Exp1|Exps]).
+parse_boolExp(InStream,xor,VarMap,Exp) =>   % "xor(" boolExp ("," boolExp)+ ")"
+    skip_until_1(InStream,'('),                       
+    read_picat_token(InStream,_,Token1),    
+    parse_boolExp(InStream,Token1,VarMap,Exp1),
+    read_picat_token(InStream,_,Token2),
+    parse_boolExpsPrime(InStream,Token2,VarMap,Exps),
+    construct_xor([Exp1|Exps],Exp).
+parse_boolExp(InStream,iff,VarMap,Exp) =>   % "iff(" boolExp ("," boolExp)+ ")"
+    skip_until_1(InStream,'('),                       
+    read_picat_token(InStream,_,Token1),    
+    parse_boolExp(InStream,Token1,VarMap,Exp1),
+    read_picat_token(InStream,_,Token2),
+    parse_boolExpsPrime(InStream,Token2,VarMap,Exps),
+    construct_iff([Exp1|Exps],Exp).
+parse_boolExp(InStream,imp,VarMap,Exp) =>   % "imp(" boolExp "," boolExp ")"
+    skip_until_1(InStream,'('),                       
+    read_picat_token(InStream,_,Token1),    
+    parse_boolExp(InStream,Token1,VarMap,Exp1),
+    skip_until_1(InStream,','),                       
+    read_picat_token(InStream,_,Token2),    
+    parse_boolExp(InStream,Token2,VarMap,Exp2),
+    Exp = (Exp1 #=> Exp2),
+    skip_until_1(InStream,')').                       
+parse_boolExp(InStream,'%',_VarMap,Exp) =>   % can't be %...       
+    read_picat_token(InStream,_,Token),
+    Index = Token+1,
+    Exp = $param(Index).
+parse_boolExp(_InStream,Token,_VarMap,Exp), int(Token) =>   % 0 or 1
+    Exp = Token.
+parse_boolExp(InStream,Token,VarMap,Exp) =>
+    Content = VarMap.get(Token),
+    (compound(Content) ->
+        skip_until_1(InStream,'['),    
+        parse_indexing(InStream,Content,Exp)
+    ;
+        Exp = Content
+    ).
+    
+construct_xor([Exp1,Exp2],Exp) =>
+    Exp = (Exp1 #^ Exp2).
+construct_xor([Exp1,Exp2|Exps],Exp) =>
+    construct_xor([(Exp1 #^ Exp2)|Exps],Exp).
+
+construct_iff([Exp1,Exp2],Exp) =>
+    Exp = (Exp1 #<=> Exp2).
+construct_iff([Exp1,Exp2|Exps],Exp) =>
+    construct_iff([(Exp1 #<=> Exp2)|Exps],Exp).
+
+%%%
+parse_intExp(InStream,neg,VarMap,Exp) =>      % "neg(" intExp ")"
+    skip_until_1(InStream,'('),
+    read_picat_token(InStream,_,Token),
+    parse_intExp(InStream,Token,VarMap,Exp1),
+    skip_until_1(InStream,')'),    
+    Exp = $-Exp1.
+parse_intExp(InStream,abs,VarMap,Exp) =>      % "abs(" intExp ")
+    skip_until_1(InStream,'('),
+    read_picat_token(InStream,_,Token),
+    parse_intExp(InStream,Token,VarMap,Exp1),
+    skip_until_1(InStream,')'),    
+    Exp = $abs(Exp1).
+parse_intExp(InStream,add,VarMap,Exp) =>      % "add(" intExp ("," intExp)+ ")"
+    skip_until_1(InStream,'('),
+    read_picat_token(InStream,_,Token1),
+    parse_intExp(InStream,Token1,VarMap,Exp1),
+    read_picat_token(InStream,_,Token2),
+    parse_intExpsPrime(InStream,Token2,VarMap,Exps),
+    (Exps = [Exp2] ->
+        Exp = $(Exp1+Exp2)
+    ;
+        Exp = $sum([Exp1|Exps])
+    ).
+parse_intExp(InStream,sub,VarMap,Exp) =>      % "sub(" intExp "," intExp ")"
+    skip_until_1(InStream,'('),
+    read_picat_token(InStream,_,Token1),
+    parse_intExp(InStream,Token1,VarMap,Exp1),
+    skip_until_1(InStream,','),    
+    read_picat_token(InStream,_,Token2),
+    parse_intExp(InStream,Token2,VarMap,Exp2),
+    skip_until_1(InStream,')'),    
+    Exp = $(Exp1-Exp2).
+parse_intExp(InStream,mul,VarMap,Exp) =>      % "mul(" intExp ("," intExp)+ ")"
+    skip_until_1(InStream,'('),
+    read_picat_token(InStream,_,Token1),
+    parse_intExp(InStream,Token1,VarMap,Exp1),
+    read_picat_token(InStream,_,Token2),
+    parse_intExpsPrime(InStream,Token2,VarMap,Exps),
+    (Exps = [Exp2] ->
+        Exp = $(Exp1*Exp2)
+    ; 
+        Exp = $prod([Exp1|Exps])
+    ).
+parse_intExp(InStream,div,VarMap,Exp) =>      % "div(" intExp "," intExp ")"
+    skip_until_1(InStream,'('),
+    read_picat_token(InStream,_,Token1),
+    parse_intExp(InStream,Token1,VarMap,Exp1),
+    skip_until_1(InStream,','),    
+    read_picat_token(InStream,_,Token2),
+    parse_intExp(InStream,Token2,VarMap,Exp2),
+    skip_until_1(InStream,')'),    
+    Exp = $(Exp1 div Exp2).
+parse_intExp(InStream,mod,VarMap,Exp) =>      % "mod(" intExp "," intExp ")"
+    skip_until_1(InStream,'('),
+    read_picat_token(InStream,_,Token1),
+    parse_intExp(InStream,Token1,VarMap,Exp1),
+    skip_until_1(InStream,','),    
+    read_picat_token(InStream,_,Token2),
+    parse_intExp(InStream,Token2,VarMap,Exp2),
+    skip_until_1(InStream,')'),    
+    Exp = $(Exp1 mod Exp2).
+parse_intExp(InStream,sqr,VarMap,Exp) =>      % "sqr(" intExp ")
+    skip_until_1(InStream,'('),
+    read_picat_token(InStream,_,Token),
+    parse_intExp(InStream,Token,VarMap,Exp1),
+    skip_until_1(InStream,')'),    
+    Exp = $(Exp1*Exp1).
+parse_intExp(InStream,pow,VarMap,Exp) =>      % "pow(" intExp "," intExp ")"
+    skip_until_1(InStream,'('),
+    read_picat_token(InStream,_,Token1),
+    parse_intExp(InStream,Token1,VarMap,Exp1),
+    skip_until_1(InStream,','),    
+    read_picat_token(InStream,_,Token2),
+    parse_intExp(InStream,Token2,VarMap,Exp2),
+    skip_until_1(InStream,')'),    
+    Exp = $(Exp1 ** Exp2).
+parse_intExp(InStream,min,VarMap,Exp) =>      % "min(" intExp ("," intExp)+ ")"
+    skip_until_1(InStream,'('),
+    read_picat_token(InStream,_,Token1),
+    parse_intExp(InStream,Token1,VarMap,Exp1),
+    read_picat_token(InStream,_,Token2),
+    parse_intExpsPrime(InStream,Token2,VarMap,Exps),
+    Exp = $min([Exp1|Exps]).
+parse_intExp(InStream,max,VarMap,Exp) =>      % "max(" intExp ("," intExp)+ ")"
+    skip_until_1(InStream,'('),
+    read_picat_token(InStream,_,Token1),
+    parse_intExp(InStream,Token1,VarMap,Exp1),
+    read_picat_token(InStream,_,Token2),
+    parse_intExpsPrime(InStream,Token2,VarMap,Exps),
+    Exp = $max([Exp1|Exps]).
+parse_intExp(InStream,dist,VarMap,Exp) =>     % "dist(" intExp "," intExp ")"
+    skip_until_1(InStream,'('),
+    read_picat_token(InStream,_,Token1),
+    parse_intExp(InStream,Token1,VarMap,Exp1),
+    skip_until_1(InStream,','),    
+    read_picat_token(InStream,_,Token2),
+    parse_intExp(InStream,Token2,VarMap,Exp2),
+    skip_until_1(InStream,')'),    
+    Exp = $abs(Exp1-Exp2).
+parse_intExp(InStream,if,VarMap,Exp) =>       % "if(" boolExp "," intExp "," intExp ")"
+    skip_until_1(InStream,'('),
+    read_picat_token(InStream,_,Token1),
+    parse_boolExp(InStream,Token1,VarMap,Exp1),
+    skip_until_1(InStream,','),    
+    read_picat_token(InStream,_,Token2),
+    parse_intExp(InStream,Token2,VarMap,Exp2),
+    skip_until_1(InStream,','),    
+    read_picat_token(InStream,_,Token3),
+    parse_intExp(InStream,Token3,VarMap,Exp3),
+    skip_until_1(InStream,')'),    
+    Exp = $cond(Exp1,Exp2,Exp3).
+parse_intExp(InStream,'+',_VarMap,Exp) =>
+    read_picat_token(InStream,_,Token),          % must be an int
+    Exp = Token.
+parse_intExp(InStream,'-',_VarMap,Exp) =>
+    read_picat_token(InStream,_,Token),          % must be an int
+    Exp = -Token.
+parse_intExp(_InStream,'*',_VarMap,Exp) =>       % in <instantiation>...</instantiation>
+    Exp = '*'.
+parse_intExp(InStream,'%',_VarMap,Exp) =>
+    read_picat_token(InStream,_,Token),  % must be an int
+    Index = Token+1,
+    Exp = $param(Index).
+parse_intExp(_InStream,Token,_VarMap,Exp), int(Token) =>   
+    Exp = Token.
+parse_intExp(InStream,Token,VarMap,Exp) =>
+    (bool_rel(Token) ->
+        parse_boolExp(InStream,Token,VarMap,Exp)
+    ;
+        Content = VarMap.get(Token),
+        (compound(Content) ->
+             skip_until_1(InStream,'['),    
+            parse_indexing(InStream,Content,Exp)
+        ;
+            Exp = Content
+        )
+    ).
+    
+% ("," intExp)+ ")"
+parse_intExpsPrime(InStream,Token,VarMap,Exps) =>
+    (Token == ',' ->
+        Exps = [Exp|ExpsR],
+        read_picat_token(InStream,_,Token1),
+        parse_intExp(InStream,Token1,VarMap,Exp),
+        read_picat_token(InStream,_,Token2),
+        parse_intExpsPrime(InStream,Token2,VarMap,ExpsR)
+    ;
+        Exps = []                                  % Token == ')'
+    ).
+
+% ("," boolExp)+ ")"
+parse_boolExpsPrime(InStream,Token,VarMap,Exps) =>
+    (Token == ',' ->
+        Exps = [Exp|ExpsR],
+        read_picat_token(InStream,_,Token1),
+        parse_boolExp(InStream,Token1,VarMap,Exp),
+        read_picat_token(InStream,_,Token2),
+        parse_boolExpsPrime(InStream,Token2,VarMap,ExpsR)
+    ;
+        Exps = []                                  % Token == ')'
+    ).
+
+parse_indexing(InStream,Arr,Exp) =>
+    read_picat_token(InStream,_,Index),            % must be an int
+    skip_until_1(InStream,']'),
+    E = Arr[Index+1],                              % indexing is 1-based in Picat
+    (compound(E) ->
+        skip_until_1(InStream,'['),
+        parse_indexing(InStream,E,Exp)
+    ;
+        Exp = E
+    ).
+
+%%%
+% x[][4]    x[2..3]   x[1], have observed x[
+parse_indexing_list(InStream,Arr,Token,List,ListR) =>
+    get_array_dims(Arr,Dims),
+    parse_indexing_subscripts(InStream,Dims,Token,Ranges),
+    access_array(Arr,Ranges,List,ListR).
+
+parse_indexing_subscripts(InStream,[Dim|Dims],Token,Ranges) =>
+    parse_indexing_subscript(InStream,Dim,Token,Range),
+    (Dims == [] ->
+        Ranges = [Range]
+    ;
+        Ranges = [Range|RangesR],
+        skip_until_1(InStream,'['),
+        read_picat_token(InStream,_,NextToken),
+        parse_indexing_subscripts(InStream,Dims,NextToken,RangesR)
+    ).
+
+parse_indexing_subscript(_InStream,Dim,']',Range) => Range = (1,Dim).   % []
+parse_indexing_subscript(InStream,_Dim,FromIndex,Range) =>
+    Index = FromIndex+1,
+    read_picat_token(InStream,_,Token1),
+    (Token1 == '..' ->
+        read_picat_token(InStream,_,ToIndex),            % must be an int
+        skip_until_1(InStream,']'),
+        Range = (Index,ToIndex+1)
+    ;                                                    % Token1 == ']'
+        Range = Index
+    ).
+
+access_array(E,[],List,ListR) =>
+    List = [E|ListR].
+access_array(Arr,[(From,To)|Ranges],List,ListR) =>
+    access_array_aux(Arr,From,To,Ranges,List,ListR).
+access_array(Arr,[E|Ranges],List,ListR) =>    
+    access_array_aux(Arr,E,E,Ranges,List,ListR).
+
+access_array_aux(_Arr,Index,ToIndex,_Ranges,List,ListR), Index > ToIndex =>
+    List = ListR.
+access_array_aux(Arr,Index,ToIndex,Ranges,List,ListR) =>
+    access_array(Arr[Index],Ranges,List,List1),
+    access_array_aux(Arr,Index+1,ToIndex,Ranges,List1,ListR).
+
+% "set(" [integer ("," integer)*] ")"
+parse_intSet(InStream,_set,VarMap,Set) =>
+    Set = [E|SetR],
+    skip_until_1(InStream,'('),
+    read_picat_token(InStream,_,Token1),
+    parse_intExp(InStream,Token1,VarMap,E),
+    read_picat_token(InStream,_,Token2),    
+    read_intSetPrime(InStream,Token2,VarMap,SetR).
+
+read_intSetPrime(InStream,',',VarMap,Set) =>
+    Set = [E|SetR],
+    read_picat_token(InStream,_,Token1),
+    parse_intExp(InStream,Token1,VarMap,E),
+    read_picat_token(InStream,_,Token2),    
+    read_intSetPrime(InStream,Token2,VarMap,SetR).
+read_intSetPrime(_InStream,_Token,_VarMap,Set) =>
+    Set = [].
+
+bool_rel(lt) => true.
+bool_rel(le) => true.
+bool_rel(ge) => true.
+bool_rel(gt) => true.
+bool_rel(ne) => true.
+bool_rel(eq) => true.
+bool_rel(in) => true.
+bool_rel(not) => true.
+bool_rel(and) => true.
+bool_rel(or) => true.
+bool_rel(xor) => true.
+bool_rel(iff) => true.
+bool_rel(imp) => true.
+
+xcsp_start_intExp(neg) => true.
+xcsp_start_intExp(abs) => true.
+xcsp_start_intExp(add) => true.
+xcsp_start_intExp(sub) => true.
+xcsp_start_intExp(mul) => true.
+xcsp_start_intExp(div) => true.
+xcsp_start_intExp(mod) => true.
+xcsp_start_intExp(sqr) => true.
+xcsp_start_intExp(pow) => true.
+xcsp_start_intExp(min) => true.
+xcsp_start_intExp(max) => true.
+xcsp_start_intExp(dist) => true.
+xcsp_start_intExp(if) => true.
+xcsp_start_intExp('*') => true.
+xcsp_start_intExp('+') => true.
+xcsp_start_intExp('-') => true.
+xcsp_start_intExp(lt) => true.
+xcsp_start_intExp(le) => true.
+xcsp_start_intExp(ge) => true.
+xcsp_start_intExp(gt) => true.
+xcsp_start_intExp(ne) => true.
+xcsp_start_intExp(eq) => true.
+xcsp_start_intExp(in) => true.
+xcsp_start_intExp(not) => true.
+xcsp_start_intExp(and) => true.
+xcsp_start_intExp(or) => true.
+xcsp_start_intExp(xor) => true.
+xcsp_start_intExp(iff) => true.
+xcsp_start_intExp(imp) => true.
+xcsp_start_intExp(T) => int(T).
+
+start_int('+') => true.
+start_int('-') => true.
+start_int(T) => int(T).
+
+%%%
+parse_allDifferent_constr(InStream,'%',_VarMap,Constr) => % \%...
+    read_picat_token(InStream,_,Token),
+    (Token == '...' ->
+        Constr = $allDifferent(params),
+        skip_until_1(InStream,'>')                     % skip until after </allDifferent>
+    ;
+        xcsp_error("c unrecognized syntax %%w\n",Token)
+    ).
+parse_allDifferent_constr(InStream,'<',VarMap,Constr) =>
+    read_picat_token(InStream,_,Token0),
+    parse_allDifferent_list_or_matrix_constr(InStream,Token0,VarMap,Constr).
+parse_allDifferent_constr(InStream,Token,VarMap,Constr) =>
+    parse_intExps(InStream,Token,VarMap,Exps,Exps),
+    Constr = $allDifferent(Exps),
+    skip_until_1(InStream,'>').                        % skip until after </allDifferent>        
+
+parse_allDifferent_list_or_matrix_constr(InStream,list,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                        % skip until after <list>    
+    read_picat_token(InStream,_,Token),
+    parse_list(InStream,Token,VarMap,Args,Args),
+    read_picat_token(InStream,_,Token2),
+    (Token2 == '<' ->                                  % <except>
+        read_picat_token(InStream,_,Except),
+        (Except == except -> true; xcsp_error("c advanced form of allDifferent unacceptable: %w\n",Except)),
+        skip_until_1(InStream,'>'),                    % skip until after <except>
+        read_picat_token(InStream,_,Token3),        
+        read_int(InStream,Token3,E),
+        Constr = $allDifferentExcept(Args,E),
+        skip_until_1(InStream,'>')                     % skip until after </except>        
+    ;
+        Constr = $allDifferent(Args)
+    ),
+    skip_until_1(InStream,'>').                        % skip until after </allDifferent>
+parse_allDifferent_list_or_matrix_constr(InStream,matrix,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                        % skip until after <matrix>        
+       read_picat_token(InStream,_,Token),
+    (Token == '(' ->
+        parse_tuples(InStream,Token,VarMap,Tuples,_HasStar),  % _HasStar not used
+        Matrix = to_array(Tuples)
+    ;
+        Matrix = VarMap.get(Token)                     % x[][]
+    ),
+       Constr = $allDifferentMatrix(Matrix),
+    skip_until_1(InStream,'>'),                        % skip until after </matrix>            
+    skip_until_1(InStream,'>').                        % skip until after </allDifferent>    
+
+%%%
+parse_lex_constr(InStream,'<',VarMap,Constr) =>
+    read_picat_token(InStream,_,Token0),
+    parse_lex_list_or_matrix_constr(InStream,Token0,VarMap,Constr).
+
+parse_lex_list_or_matrix_constr(InStream,list,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                        % skip until after <list>    
+    read_picat_token(InStream,_,Token),
+    parse_list(InStream,Token,VarMap,List,List),
+    skip_until_1(InStream,'<'),                        % skip until beforer operator>
+    read_picat_token(InStream,_,Token2),
+    parse_lex_constr_after_list(InStream,Token2,VarMap,Lists,Rel),
+    Constr = $lex([List|Lists],Rel),
+    skip_until_1(InStream,'>').                        % skip until after </lex>     
+parse_lex_list_or_matrix_constr(InStream,matrix,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                        % skip until after <matrix>        
+    read_picat_token(InStream,_,Token),
+    (Token == '(' ->
+        parse_tuples(InStream,Token,VarMap,Tuples,_HasStar),  % _HasStar not used
+        Matrix = to_array(Tuples)
+    ;
+        Matrix = VarMap.get(Token)                     % x[][]
+    ),
+    skip_until_1(InStream,'>'),                        % skip until after </matrix>            
+    skip_until_1(InStream,'>'),                        % skip until after <operator>                
+    read_picat_token(InStream,_,Rel),
+    skip_until_1(InStream,'>'),                        % skip until after </operator>                
+    Constr = $lexMatrix(Matrix,Rel),
+    skip_until_1(InStream,'>').                        % skip until after </lex>    
+
+%%%
+parse_lex_constr_after_list(InStream,list,VarMap,Lists,Rel) =>
+    skip_until_1(InStream,'>'),                        % skip until after <list>    
+    read_picat_token(InStream,_,Token),
+    parse_list(InStream,Token,VarMap,List,List),
+    Lists = [List|ListsR],
+    skip_until_1(InStream,'<'),                        % skip until beforer list> or operator>
+    read_picat_token(InStream,_,Token2),
+    parse_lex_constr_after_list(InStream,Token2,VarMap,ListsR,Rel).
+parse_lex_constr_after_list(InStream,operator,_VarMap,Lists,Rel) =>
+    Lists = [],
+    skip_until_1(InStream,'>'),
+    read_picat_token(InStream,_,Rel),
+    skip_until_1(InStream,'>').                        % skip until after </operator>                
+
+%%%
+parse_minmax_constr(InStream,'<',VarMap,Type,Constr) =>
+    skip_until_1(InStream,'>'),                        % skip until after <list>    
+    read_picat_token(InStream,_,Token),
+    parse_list(InStream,Token,VarMap,Args,Args),
+    skip_until_1(InStream,'>'),                        % skip until after <condition>        
+    read_picat_token(InStream,_,Token2),
+    parse_condition(InStream,Token2,VarMap,Rel,Operand),
+    Constr = $minmax(Type,Args,Rel,Operand),
+    skip_until_1(InStream,'>').                        % skip until after </maximum> or </minimum>
+
+parse_condition(InStream,'(',VarMap,Rel,Operand) =>
+    read_picat_token(InStream,_,Rel),
+    read_picat_token(InStream,_,_),                    % ,
+    read_picat_token(InStream,_,Token),
+    parse_operand(InStream,Token,VarMap,Operand),
+    skip_until_1(InStream,'>').                        % skip until after </condition>        
+
+parse_operand(InStream,Token,VarMap,Operand) =>
+    parse_intExp(InStream,Token,VarMap,Exp1),
+    read_picat_token(InStream,_,Token2),
+    (Token2 == '..' ->
+        read_picat_token(InStream,_,Token3),        
+        parse_intExp(InStream,Token3,VarMap,Exp2),
+        Operand = $range(Exp1,Exp2)
+    ;
+        Operand = Exp1
+    ).
+
+%%%
+parse_sum_constr(InStream,'<',VarMap,Constr) =>        % skip until after <list>    
+    skip_until_1(InStream,'>'),                        
+    read_picat_token(InStream,_,Token),
+    parse_list(InStream,Token,VarMap,Args,Args),
+    skip_until_1(InStream,'<'),                        % skip until beforer coeffs> or condition>            
+    read_picat_token(InStream,_,Token2),
+    parse_sum_constr_after_list(InStream,Args,Token2,VarMap,Constr).
+
+parse_sum_constr_after_list(InStream,Args,coeffs,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                        
+    read_picat_token(InStream,_,Token),
+    parse_list(InStream,Token,VarMap,Coes,Coes),
+    skip_until_1(InStream,'>'),                        % skip until after <condition>        
+    read_picat_token(InStream,_,Token2),
+    parse_condition(InStream,Token2,VarMap,Rel,Operand),
+    Constr = $agg_sum(Coes,Args,Rel,Operand),
+    skip_until_1(InStream,'>').                        % skip until after </sum> 
+parse_sum_constr_after_list(InStream,Args,condition,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),
+    read_picat_token(InStream,_,Token),
+    parse_condition(InStream,Token,VarMap,Rel,Operand),
+    Constr = $agg_sum_unit_coes(Args,Rel,Operand),         
+    skip_until_1(InStream,'>').                        % skip until after </sum> 
+
+%%%
+parse_count_constr(InStream,'<',VarMap,Constr) =>        
+    skip_until_1(InStream,'>'),                        % skip until after <list>    
+    read_picat_token(InStream,_,Token1),
+    parse_list(InStream,Token1,VarMap,Args,Args),
+    skip_until_1(InStream,'>'),                        % skip until after <values>
+    read_picat_token(InStream,_,Token2),
+    parse_list(InStream,Token2,VarMap,Vals,Vals),
+    skip_until_1(InStream,'>'),                        % skip until after <condition>        
+    read_picat_token(InStream,_,Token3),
+    parse_condition(InStream,Token3,VarMap,Rel,Operand),
+    Constr = $agg_count(Args,Vals,Rel,Operand),
+    skip_until_1(InStream,'>').                        % skip until after </count> 
+
+%%%
+parse_nValues_constr(InStream,'<',VarMap,Constr) =>        
+    skip_until_1(InStream,'>'),                        % skip until after <list>    
+    read_picat_token(InStream,_,Token1),
+    parse_list(InStream,Token1,VarMap,Args,Args),
+    read_picat_token(InStream,_,Token2),
+    read_picat_token(InStream,_,Token3),
+    parse_nValues_constr_after_list(InStream,Args,Token2,Token3,VarMap,Constr).
+
+parse_nValues_constr_after_list(InStream,List,'<',condition,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                        % skip until after <condition>        
+    read_picat_token(InStream,_,Token),
+    parse_condition(InStream,Token,VarMap,Rel,Operand),
+    Constr = $nValues(List,Rel,Operand),
+    skip_until_1(InStream,'>').                        % skip until after </nValues> 
+parse_nValues_constr_after_list(InStream,List,'<',except,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                        % skip until after <except>
+    read_picat_token(InStream,_,Token1),
+    parse_intExp(InStream,Token1,VarMap,Val),
+    skip_until_1(InStream,'>'),                        % skip until after </except>            
+    skip_until_1(InStream,'>'),                        % skip until after <condition>        
+    read_picat_token(InStream,_,Token2),
+    parse_condition(InStream,Token2,VarMap,Rel,Operand),
+    Constr = $nValuesExcept(List,Val,Rel,Operand),
+    skip_until_1(InStream,'>').                        % skip until after </nValues> 
+
+%%%
+parse_allEqual_constr(InStream,'<',VarMap,Constr) =>        
+    skip_until_1(InStream,'>'),                        % skip until after <list>    
+    read_picat_token(InStream,_,Token),
+    parse_list(InStream,Token,VarMap,Args,Args),
+    Constr = $allEqual(Args),
+    skip_until_1(InStream,'>').                        % skip until after </allEqual> 
+parse_allEqual_constr(InStream,Token,VarMap,Constr) =>
+    parse_intExps(InStream,Token,VarMap,Args,Args),
+    Constr = $allEqual(Args),
+    skip_until_1(InStream,'>').                        % skip until after </allEqual> 
+
+%%%
+parse_ordered_constr(InStream,'<',VarMap,Constr) =>    
+    skip_until_1(InStream,'>'),                        % skip until after <list>    
+    read_picat_token(InStream,_,Token),
+    parse_list(InStream,Token,VarMap,Args,Args),
+    skip_until_1(InStream,'<'),                        % skip until beforer lengths> or operator>
+    read_picat_token(InStream,_,Token2),
+    parse_ordered_constr_after_list(InStream,Args,Token2,VarMap,Constr).
+
+parse_ordered_constr_after_list(InStream,Args,lengths,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                        
+    read_picat_token(InStream,_,Token),
+    parse_list(InStream,Token,VarMap,Lens,Lens),
+    skip_until_1(InStream,'>'),                        % skip until after operator>            
+    read_picat_token(InStream,_,Rel),
+    skip_until_1(InStream,'>'),                        % skip until after </operator>                
+    Constr = $ordered(Args,Lens,Rel),
+    skip_until_1(InStream,'>').                        % skip until after </ordered> 
+parse_ordered_constr_after_list(InStream,Args,operator,_VarMap,Constr) =>
+    skip_until_1(InStream,'>'),
+    read_picat_token(InStream,_,Rel),
+    skip_until_1(InStream,'>'),                        % skip until after </operator>                
+    Constr = $ordered(Args,Rel),       
+    skip_until_1(InStream,'>').                        % skip until after </ordered> 
+
+%%%
+parse_allDistant_constr(InStream,'<',VarMap,Constr) =>        
+    skip_until_1(InStream,'>'),                        % skip until after <list>    
+    read_picat_token(InStream,_,Token1),
+    parse_list(InStream,Token1,VarMap,Args,Args),
+    skip_until_1(InStream,'>'),                        % skip until after <condition>        
+    read_picat_token(InStream,_,Token2),
+    parse_condition(InStream,Token2,VarMap,Rel,Operand),
+    Constr = $allDistant(Args,Rel,Operand),
+    skip_until_1(InStream,'>').                        % skip until after </allDistant> 
+
+%%%
+parse_instantiation_constr(InStream,'<',VarMap,Constr) =>        
+    skip_until_1(InStream,'>'),                        % skip until after <list>    
+    read_picat_token(InStream,_,Token1),
+    parse_list(InStream,Token1,VarMap,Args,Args),
+    skip_until_1(InStream,'>'),                        % skip until after <values>
+    read_picat_token(InStream,_,Token2),    
+    parse_list(InStream,Token2,VarMap,Vals,Vals),
+    Constr = $instantiation(Args,Vals),
+    skip_until_1(InStream,'>').                        % skip until after </instantiation>
+
+%%%
+parse_cardinality_constr(InStream,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                        % skip until after <list>    
+    read_picat_token(InStream,_,Token1),
+    parse_list(InStream,Token1,VarMap,List,List),
+    skip_until_1(InStream,'>'),                        % skip until after <values>
+    read_picat_token(InStream,_,Token2),
+    parse_list(InStream,Token2,VarMap,Vals,Vals),
+    skip_until_1(InStream,'>'),                        % skip until after <occurs>
+    read_picat_token(InStream,_,Token3),
+    parse_intExps(InStream,Token3,VarMap,Occurs,Occurs),
+    Constr = $cardinality(List,Vals,Occurs),
+    skip_until_1(InStream,'>'),                        % skip until after </occurs>
+    skip_until_1(InStream,'>').                        % skip until after </cardinality>     
+
+%%%
+parse_noOverlap_constr(InStream,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                        % skip until after <origins>    
+    read_picat_token(InStream,_,Token1),
+    parse_tuples(InStream,Token1,VarMap,Origs,_),
+    skip_until_1(InStream,'>'),                        % skip until after </origins>
+    skip_until_1(InStream,'>'),                        % skip until after <lengths>
+    read_picat_token(InStream,_,Token2),
+    parse_tuples(InStream,Token2,VarMap,Lens,_HasStar),
+    skip_until_1(InStream,'>'),                        % skip until after </lengths>
+    Constr = $noOverlap(Origs,Lens),    
+    skip_until_1(InStream,'>').                        % skip until after </noOverlap>
+
+%%%
+parse_regular_constr(InStream,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                       % skip until after <list>    
+    read_picat_token(InStream,_,Token),
+    parse_list(InStream,Token,VarMap,Vars,Vars),
+    skip_until_1(InStream,'>'),                       % skip <transitions>
+    StateMap = new_map(),
+    read_picat_token(InStream,_,Token2),    
+    parse_transitions(InStream,Token2,1,Q,_MinI0,MinI,_MaxI0,MaxI,StateMap,Triplets),   % Q - number of states in this DA
+    parse_regular_start(InStream,StateMap,Q0),         % Q0 - start state
+    skip_until_1(InStream,'>'),                        % skip <final>
+    read_picat_token(InStream,_,FirstFToken),    
+    parse_regular_final(InStream,FirstFToken,StateMap,Fs), % Fs - final states
+    Constr = $regular(Vars,MinI,MaxI,Q,Q0,Fs,Triplets),
+    skip_until_1(InStream,'>').                       % skip until after </regular>    
+
+parse_transitions(InStream,'(',Q1,Q,MinI0,MinI,MaxI0,MaxI,StateMap,Triplets) =>   % start another tuple
+    read_picat_token(InStream,_,A),                    % From
+    read_picat_token(InStream,_,_),                       % ','
+    read_picat_token(InStream,_,X),                       % To
+    read_picat_token(InStream,_,_),                       % ','    
+    read_picat_token(InStream,_,B),                    % From    
+    read_picat_token(InStream,_,_),                       % ')'
+    (var(MinI0) ->
+        MinI1 = X, MaxI1 = X
+    ;
+        MinI1 = min(X,MinI0), MaxI1 = max(X,MaxI0)
+    ),
+    convert_state(A,FromState,Q1,Q2,StateMap),
+    convert_state(B,ToState,Q2,Q3,StateMap),
+    Triplets = [{FromState,X,ToState}|TripletsR],
+    read_picat_token(InStream,_,Token),
+    parse_transitions(InStream,Token,Q3,Q,MinI1,MinI,MaxI1,MaxI,StateMap,TripletsR).
+parse_transitions(InStream,_,Q1,Q,MinI0,MinI,MaxI0,MaxI,_StateMap,Triplets) =>   % </transitions>
+    Triplets = [],
+    Q = Q1-1,
+    MinI = MinI0,
+    MaxI = MaxI0,
+    skip_until_1(InStream,'>').
+
+parse_regular_start(InStream,StateMap,Q0) =>
+    skip_until_1(InStream,'>'),                         % <start>
+    read_picat_token(InStream,_,A),
+    Q0 = StateMap.get(A),
+    skip_until_1(InStream,'>').                         % </start>    
+    
+parse_regular_final(InStream,'</',_StateMap,Fs) =>     % </final>
+    Fs = [],
+    skip_until_1(InStream,'>').                         
+parse_regular_final(InStream,A,StateMap,Fs) =>
+    Fs = [StateMap.get(A)|FsR],
+    read_picat_token(InStream,_,NextToken),
+    parse_regular_final(InStream,NextToken,StateMap,FsR).
+
+convert_state(A,State,Q1,Q2,StateMap) =>
+    State = StateMap.get(A,Q1),
+    (State == Q1 ->
+        StateMap.put(A,Q1),
+        Q2 = Q1+1
+    ;
+        Q2 = Q1
+    ).
+
+%%%
+parse_mdd_constr(InStream,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                        % skip until after <list>    
+    read_picat_token(InStream,_,Token),
+    parse_list(InStream,Token,VarMap,Vars,Vars),
+    skip_until_1(InStream,'>'),                        % skip <transitions>
+    StateMap = new_map(),
+    read_picat_token(InStream,_,Token2),    
+    parse_transitions(InStream,Token2,1,Q,_MinI0,_MinI,_MaxI0,_MaxI,StateMap,Triplets),   % Q - number of states in this DA
+    Constr = $mdd(Vars,Q,Triplets),
+    skip_until_1(InStream,'>').                        % skip until after </mdd>    
+
+%%%
+parse_cumulative_constr(InStream,VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                        % skip until after <origins>
+    read_picat_token(InStream,_,Token1),
+    parse_list(InStream,Token1,VarMap,Origs,Origs),
+    skip_until_1(InStream,'>'),                        % skip until after <lengths>    
+    read_picat_token(InStream,_,Token2),
+    parse_list(InStream,Token2,VarMap,Lens,Lens),
+    read_picat_token(InStream,_,_),                    % <    
+    read_picat_token(InStream,_,Token3),               
+    (Token3 == ends ->
+        skip_until_1(InStream,'>'),                        % skip until after <lengths>    
+        read_picat_token(InStream,_,Token4),
+        parse_list(InStream,Token4,VarMap,Ends,Ends)
+    ;
+        true
+    ),
+    skip_until_1(InStream,'>'),                        % skip until after <heights>    
+    read_picat_token(InStream,_,Token5),
+       parse_list(InStream,Token5,VarMap,Heights,Heights),
+    skip_until_1(InStream,'>'),                        % skip until after <condition>        
+    read_picat_token(InStream,_,Token6),
+    parse_condition(InStream,Token6,VarMap,Rel,Operand),
+    Constr = $cumulative(Origs,Lens,Ends,Heights,Rel,Operand),
+    skip_until_1(InStream,'>').                        % skip until after </cumulative>            
+
+%%%
+parse_circuit_constr(InStream,'<',VarMap,Constr) =>
+    skip_until_1(InStream,'>'),                        % skip until after <list>
+    read_picat_token(InStream,_,Token1),
+    parse_list(InStream,Token1,VarMap,List,List),
+    Constr = $xcsp_circuit(List),
+    skip_until_1(InStream,'>').                        % skip until after <circuit>    
+parse_circuit_constr(InStream,Token,VarMap,Constr) =>  % args are not surrounded by <list> and </list>
+    parse_intExps(InStream,Token,VarMap,List,List),
+    Constr = $xcsp_circuit(List),
+    skip_until_1(InStream,'>').                        % skip until after <circuit>    
+
+%%%
+parse_element_constr(InStream,'<',VarMap,Constr) =>
+    read_picat_token(InStream,_,Token0),
+    parse_startIndex(InStream,Token0,StartIndex),
+    read_picat_token(InStream,_,Token),
+    parse_list(InStream,Token,VarMap,Args,Args),
+    read_picat_token(InStream,_,_),                    % <
+    read_picat_token(InStream,_,Token2),                
+    (Token2 == 'index' ->                              % <except>
+        skip_until_1(InStream,'>'),                    % skip until after <index>
+        read_picat_token(InStream,_,Token3),        
+        parse_intExp(InStream,Token3,VarMap,Index),
+        skip_until_1(InStream,'>')                     % skip until after </index>
+    ;
+        true
+    ),
+    skip_until_1(InStream,'>'),                        % skip until after <value>        
+    read_picat_token(InStream,_,Token4),
+    parse_intExp(InStream,Token4,VarMap,Val),    
+    skip_until_1(InStream,'>'),                        % skip until after </value>
+    skip_until_1(InStream,'>'),                        % skip until after </element>            
+    Constr = $element(StartIndex,Index,Args,Val).
+
+%%%
+parse_channel_constr(InStream,'<',VarMap,Constr) =>    % <list>
+    read_picat_token(InStream,_,Token1),                
+    parse_startIndex(InStream,Token1,StartIndex1),
+    read_picat_token(InStream,_,Token2),
+    parse_list(InStream,Token2,VarMap,List1,List1),
+    read_picat_token(InStream,_,Token3),
+    parse_channel_after_list1(InStream,Token3,VarMap,StartIndex1,List1,Constr),
+    skip_until_1(InStream,'>').                        % skip until after </channel>
+parse_channel_constr(InStream,Token,VarMap,Constr) =>  % a list not surrounded by <list> ... </list>
+    parse_intExps(InStream,Token,VarMap,List,List),
+    Constr = $channel_lst(0,List),
+    skip_until_1(InStream,'>').                        % skip until after </channel>    
+
+parse_startIndex(_InStream,'>',StartIndex) =>
+    (var(StartIndex) -> StartIndex = 0; true).
+parse_startIndex(InStream,startIndex,StartIndex) =>
+    read_picat_token(InStream,_,_),                         % =
+    read_picat_token(InStream,_,StartIndexStr),
+    StartIndex = to_int(StartIndexStr),
+    skip_until_1(InStream,'>').                        % skip until after <list ...>        
+parse_startIndex(InStream,_,StartIndex) =>
+    read_picat_token(InStream,_,Token),
+    parse_startIndex(InStream,Token,StartIndex).
+
+parse_channel_after_list1(InStream,'<',VarMap,StartIndex1,List1,Constr) =>   % another list <list...>
+    read_picat_token(InStream,_,Token1),
+    (Token1 == list ->
+        parse_startIndex(InStream,Token1,StartIndex2),
+        read_picat_token(InStream,_,Token2),
+        parse_list(InStream,Token2,VarMap,List2,List2),
+        Constr = $channel_lst_lst(StartIndex1,List1,StartIndex2,List2)
+    ;                                                                         % Token1 = value
+        skip_until_1(InStream,'>'),                        % skip until after <value>
+        read_picat_token(InStream,_,Token2),        
+        parse_intExp(InStream,Token2,VarMap,IndexVar),
+        Constr = $channel_01(StartIndex1,List1,IndexVar),
+        skip_until_1(InStream,'>')                        % skip until after </value>        
+    ).
+parse_channel_after_list1(_InStream,'</',_VarMap,StartIndex1,List1,Constr) =>   % only one list
+    Constr = $channel_lst(StartIndex1,List1).    
+
+%%%
+parse_slide_circular(_InStream,'>',Circular) =>
+    (var(Circular) -> Circular = 0; true).
+parse_slide_circular(InStream,circular,Circular) =>
+    read_picat_token(InStream,_,_),                    % =
+    read_picat_token(InStream,_,CircularStr),
+    (strip(CircularStr) == "true" -> Circular = 1; Circular = 0),
+    skip_until_1(InStream,'>').                        % skip until after <slide ...>        
+parse_slide_circular(InStream,_,Circular) =>
+    read_picat_token(InStream,_,Token),
+    parse_slide_circular(InStream,Token,Circular).
+
+parse_slide_offset(_InStream,'>',Offset) =>
+    (var(Offset) -> Offset = 1; true).
+parse_slide_offset(InStream,offset,Offset) =>
+    read_picat_token(InStream,_,_),                    % =
+    read_picat_token(InStream,_,OffsetStr),
+    Offset = to_int(OffsetStr),
+    skip_until_1(InStream,'>').                        % skip until after <list ...>        
+parse_slide_offset(InStream,_,Offset) =>
+    read_picat_token(InStream,_,Token),
+    parse_slide_offset(InStream,Token,Offset).
+
+parse_slide(InStream,VarMap,Circular) =>
+    read_picat_token(InStream,_,Token1),
+    parse_slide_offset(InStream,Token1,Offset),
+    read_picat_token(InStream,_,Token2),
+    parse_list(InStream,Token2,VarMap,List,List),
+    read_picat_token(InStream,_,_),                    % <
+    read_picat_token(InStream,_,KeyToken),             % extension or intension
+    read_picat_token(InStream,_,_),                    % >
+    (KeyToken == extension ->
+        parse_extension_constr(InStream,VarMap,Constr)
+    ; KeyToken == intension ->
+        read_picat_token(InStream,_,Token3),        
+        parse_intension_constr(InStream,Token3,VarMap,Constr)
+    ;
+        xcsp_error("unrecognized constraint %w\n",KeyToken)
+    ),
+    skip_until_1(InStream,'>'),                         % skip until after </slide>
+    post_slide(List,Constr,Circular,Offset).
+
+post_slide(List,Constr@table(_Type,Scope,_Tuples,_HasStar),Circular,Offset) =>
+    Arity = len(Scope),
+    post_slide_aux(List,Constr,Circular,Offset,Arity).
+post_slide(List,Constr,Circular,Offset) =>
+    retrieve_arity(Constr,0,Arity),
+    post_slide_aux(List,Constr,Circular,Offset,Arity).    
+
+retrieve_arity(param(I),Arity0,Arity) =>
+    Arity = max(I,Arity0).
+retrieve_arity(T,Arity0,Arity),var(T) =>
+    Arity = Arity0.
+retrieve_arity(T,Arity0,Arity),atomic(T) =>    
+    Arity = Arity0.
+retrieve_arity([X|Xs],Arity0,Arity) =>
+    retrieve_arity(X,Arity0,Arity1),
+    retrieve_arity(Xs,Arity1,Arity).
+retrieve_arity(T,Arity0,Arity) =>
+    Arity1 = max([ArityI : I in 1..len(T), retrieve_arity(T[I],0,ArityI)]),
+    Arity = max(Arity1,Arity0).
+
+post_slide_aux(List,Constr,Circular,Offset,Arity) =>
+    construct_slide_arg_lists(List,Arity,Circular,Offset,ArgLists),
+    foreach (ArgList in ArgLists)
+        substitute_constr_args(Constr,ArgList,Constr1),
+        post_constr(Constr1)
+    end.
+
+construct_slide_arg_lists(List,Arity,Circular,Offset,ArgLists) =>
+    Len0 = len(List),
+    (Circular == 1 ->
+        Arity1 = Arity-1,
+        List1 = List ++ take(List,Arity1),
+        Len = Len0+Arity1
+    ;
+        List1 = List,
+        Len = Len0
+    ),
+    construct_slide_arg_lists_aux(List1,Len,Arity,Offset,ArgLists).
+
+construct_slide_arg_lists_aux(_List,Len,Arity,_Offset,ArgLists), Len < Arity =>
+    ArgLists = [].
+construct_slide_arg_lists_aux(List,Len,Arity,Offset,ArgLists) =>
+    ArgList = take(List,Arity),
+    ArgLists = [ArgList|ArgListsR],
+    construct_slide_arg_lists_aux(drop(List,Offset),Len-Offset,Arity,Offset,ArgListsR).
+
+%%%%
+/*
+parse_objectives(InStream,Type,VarMap,Objs) ?=>
+    writeln($parse_objectives(InStream,Type,Objs)),fail.
+*/    
+parse_objectives(InStream,minimize,VarMap,Objs) =>
+    Objs = [$min(ObjFunc)|ObjsR],
+    read_picat_token(InStream,_,Attr),
+    parse_objective_attrs(InStream,Attr,VarMap,ObjFunc,_ObjFuncType),
+    read_next_key_token(InStream,NextKeyToken),
+    parse_objectives(InStream,NextKeyToken,VarMap,ObjsR).
+parse_objectives(InStream,maximize,VarMap,Objs) =>
+    Objs = [$max(ObjFunc)|ObjsR],
+    read_picat_token(InStream,_,Attr),
+    parse_objective_attrs(InStream,Attr,VarMap,ObjFunc,_ObjFuncType),
+    read_next_key_token(InStream,NextKeyToken),
+    parse_objectives(InStream,NextKeyToken,VarMap,ObjsR).
+parse_objectives(InStream,objectives,VarMap,Objs) =>  % </objectives>
+    Objs = [],
+    read_next_key_token(InStream,NextKeyToken),    
+    parse_sections(InStream,NextKeyToken,VarMap,Objs).
+
+/*
+parse_objective_attrs(InStream,Token,VarMap,ObjFunc,ObjFuncType) ?=>
+    writeln($parse_objective_attrs(Token)),fail.
+*/
+parse_objective_attrs(InStream,'>',VarMap,ObjFunc,ObjFuncType) =>    
+    (var(ObjFuncType) ->
+        ObjFuncType = expression
+    ;
+        true
+    ),
+    read_picat_token(InStream,_,Token),    
+    parse_objective_func(InStream,VarMap,Token,ObjFunc,ObjFuncType),
+    skip_until_1(InStream,'>').                       % skip until after </minimize> or </maximize>
+parse_objective_attrs(InStream,type,VarMap,ObjFunc,ObjFuncType) =>  % type = sum | maximum | ...
+    read_picat_token(InStream,_,_),                         % =
+    read_picat_token(InStream,_,TypeStr),
+    ObjFuncType = to_atom(TypeStr),
+    read_picat_token(InStream,_,Next),
+    parse_objective_attrs(InStream,Next,VarMap,ObjFunc,ObjFuncType).
+parse_objective_attrs(InStream,_Attr,VarMap,ObjFunc,ObjFuncType) =>
+    read_picat_token(InStream,_,Token),
+    parse_objective_attrs(InStream,Token,VarMap,ObjFunc,ObjFuncType).
+
+/*
+parse_objective_func(InStream,VarMap,Token,ObjFunc,ObjFuncType) ?=>
+    writeln($parse_objective_func(InStream,Token,ObjFunc,ObjFuncType)),fail.
+*/
+parse_objective_func(InStream,VarMap,Token,ObjFunc,expression) =>
+    parse_intExp(InStream,Token,VarMap,ObjFunc).
+parse_objective_func(InStream,VarMap,'<',ObjFunc,ObjFuncType) =>     % <list>
+    read_picat_token(InStream,_,_),                                  % list
+    read_picat_token(InStream,_,_),                                  % >
+    read_picat_token(InStream,_,Token),
+    parse_list(InStream,Token,VarMap,Vars,Vars),
+    read_picat_token(InStream,_,Token2),
+    (Token2 == '<' ->
+        skip_until_1(InStream,'>'),                                   % skip until after <coeffs>
+        read_picat_token(InStream,_,Token3),
+        parse_list(InStream,Token3,VarMap,Coes,Coes)
+    ;
+        Coes = [1 : _ in Vars]
+    ),
+    List = [$(Coe*Var) : {Coe,Var} in zip(Coes,Vars)],
+    construct_obj_func(ObjFuncType,List,ObjFunc).
+parse_objective_func(InStream,VarMap,Token,ObjFunc,ObjFuncType) =>     % exp1 exp2 ...
+    parse_intExps(InStream,Token,VarMap,Vars,Vars),
+    construct_obj_func(ObjFuncType,Vars,ObjFunc).    
+
+construct_obj_func(sum,List,ObjFunc) =>
+    sum(List) #= T,
+    ObjFunc = T.
+construct_obj_func(minimum,List,ObjFunc) =>
+    min(List) #= T,
+    ObjFunc = T.
+construct_obj_func(maximum,List,ObjFunc) =>
+    max(List) #= T,
+    ObjFunc = T.
+construct_obj_func(nValues,List,ObjFunc) =>
+    N = len(List),
+    T :: 0..N,
+    nValues(List,T),
+    ObjFunc = T.
+
+% substitute params for Args
+substitute_constr_args(Constr,RArgs,ConstrCP),
+    substitute_entire_params(Constr,len(Constr),RArgs,ConstrCP)
+=>
+    true.    
+substitute_constr_args(Constr,RArgs,ConstrCP) =>
+    RArgVect = RArgs.to_array(),
+    substitute_param(Constr,RArgVect,ConstrCP).
+
+% replace %... by RArgs
+substitute_entire_params(_Constr,I,_RArgs,_ConstrCP), I == 0 => fail.   % no params in Constr
+substitute_entire_params(Constr,I,RArgs,ConstrCP), Constr[I] == params =>
+    ConstrCP = copy_term_shallow(Constr),
+    foreach (J in 1..len(Constr))
+        (I == J -> ConstrCP[J] = RArgs; ConstrCP[J] = Constr[J])
+    end.
+substitute_entire_params(Constr,I,RArgs,ConstrCP) =>
+    substitute_entire_params(Constr,I-1,RArgs,ConstrCP).
+
+% substitute param(I) for RArgVect[I]
+substitute_param(Term,_RArgVect,TermCP), var(Term) => TermCP = Term.
+substitute_param(Term,_RArgVect,TermCP), atomic(Term) => TermCP = Term.
+substitute_param(param(I),RArgVect,TermCP) => TermCP = RArgVect[I].
+substitute_param([X|Xs],RArgVect,TermCP) =>
+    TermCP = [XCP|XsCP],
+    substitute_param(X,RArgVect,XCP),
+    substitute_param(Xs,RArgVect,XsCP).
+substitute_param(Term,RArgVect,TermCP) =>
+    TermCP = copy_term_shallow(Term),
+    foreach (I in 1..len(Term))
+        substitute_param(Term[I],RArgVect,TermCP[I])
+    end.
+
+%%%
+/*
+post_constr(Constr) ?=>
+    writeln($posting(Constr)),
+    fail.
+*/
+post_constr(Exp1 #< Exp2) =>
+    Exp1 #< Exp2.
+post_constr(Exp1 #=< Exp2) =>
+    Exp1 #=< Exp2.
+post_constr(Exp1 #>= Exp2) =>
+    Exp1 #>= Exp2.
+post_constr(Exp1 #> Exp2) =>
+    Exp1 #> Exp2.
+post_constr(Exp1 #!= Exp2) =>
+    Exp1 #!= Exp2.
+post_constr(Exp1 #= Exp2) =>
+    Exp1 #= Exp2.
+post_constr(X :: D) =>
+    (ground(D) ->
+        X :: D
+    ;
+        sum([X #= Y : Y in D]) #>= 1
+    ).
+post_constr(#~ Exp1) =>
+    #~ Exp1.
+post_constr(Exp@min(_)) =>                           % and
+    Exp #= 1.
+post_constr(Exp@max(_)) =>
+    Exp #>= 1.
+post_constr(Exp1 #^ Exp2) =>
+    Exp1 #^ Exp2.
+post_constr(Exp1 #<=> Exp2) =>
+    Exp1 #<=> Exp2.
+post_constr(Exp1 #=> Exp2) =>
+    Exp1 #=> Exp2.
+post_constr(table(Type,Scope@[_|_],Tuples,HasStar)) =>      % list(Scope)
+    post_constr($table(Type,Scope.to_array(),Tuples,HasStar)).
+post_constr(table(Type,Scope,Tuples,_HasStar)) =>   % Picat version 2.6 supports short tables that contain '*'
+    (Type == supports ->
+        (len(Scope) > 1 -> table_in(Scope,Tuples); Scope :: Tuples)
+    ;
+        (len(Scope) > 1 -> table_notin(Scope,Tuples); notin(Scope,Tuples))
+    ).
+post_constr(lexMatrix(Matrix,Rel)) =>
+    NRows = len(Matrix),
+    NCols = len(Matrix[1]),
+    Lists1 = [[Matrix[I,J] : J in 1..NCols] : I in 1..NRows],
+    xcsp_lex(Lists1,Rel),
+    Lists2 = [[Matrix[I,J] : I in 1..NRows] : J in 1..NCols],
+    xcsp_lex(Lists2,Rel).
+post_constr(allDifferentMatrix(Matrix)) =>
+    NRows = len(Matrix),
+    NCols = len(Matrix[1]),
+    foreach (I in 1..NRows)
+        all_different(Matrix[I])
+    end,
+    foreach (J in 1..NCols)
+        all_different([Matrix[I,J] : I in 1..NRows])
+    end.
+post_constr(allDifferent(Args)) =>
+    all_different(Args).
+post_constr(allDifferentExcept(Args@[_|_],E)) =>
+    Xs = to_array(Args),
+    foreach(I in 1..Xs.length, J in 1..I-1)
+        Xs[I] #= E #\/ Xs[J] #= E #\/ Xs[I] #!= Xs[J]
+    end.
+post_constr(minmax(min,Args,Rel,Operand)) =>
+    post_constr($min(Args),Rel,Operand).
+post_constr(minmax(max,Args,Rel,Operand)) =>
+    post_constr($max(Args),Rel,Operand).
+post_constr(agg_sum(Coes,Args,Rel,Operand)) =>
+    Sum = [$(Coe*Arg) : {Coe,Arg} in zip(Coes,Args)],
+    post_constr($sum(Sum),Rel,Operand).
+post_constr(agg_sum_unit_coes(Args,Rel,Operand)) =>
+    post_constr($sum(Args),Rel,Operand).
+post_constr(agg_count(List,[V],Rel,Operand)) =>
+    post_constr($count(V,List),Rel,Operand).
+post_constr(agg_count(List,Vals,Rel,Operand)) =>
+    Sum = [count(X,Vals) #>= 1 : X in List],
+    post_constr($sum(Sum),Rel,Operand).
+post_constr(nValues(List,Rel,Operand)) =>
+    N = len(List),
+    T :: 0..N,
+    nValues(List,T),
+    post_constr(T,Rel,Operand).
+post_constr(nValuesExcept(List,Val,Rel,Operand)) =>
+    N = len(List),
+    T :: 0..N,
+    nValuesExcept(List,Val,T),
+    post_constr(T,Rel,Operand).
+post_constr(eq(List)) =>
+    allEqual(List).
+post_constr(allEqual(List)) =>
+    allEqual(List).
+post_constr(ordered(List,Rel)) =>
+    ordered(List,Rel).
+post_constr(ordered(List,Lens,Rel)) =>
+    ordered(List,Lens,Rel).
+post_constr(allDistant(List,Rel,Operand)) =>
+    allDistant(List,Rel,Operand).
+post_constr(instantiation(Args,Vals)) =>
+    instantiation(Args,Vals).
+post_constr(channel_lst_lst(StartIndex1,List1,StartIndex2,List2)) =>
+    Arr1 = to_array(List1),
+    Arr2 = to_array(List2),
+    N1 = len(Arr1),
+    N2 = len(Arr2),
+    EndIndex1 = StartIndex1+N1-1,
+    EndIndex2 = StartIndex2+N2-1,    
+    (N1 == N2 ->
+        List1 :: StartIndex2..EndIndex2,
+        List2 :: StartIndex1..EndIndex1,        
+        foreach (I in StartIndex1..EndIndex1, J in StartIndex2..EndIndex2)
+            Arr1[I-StartIndex1+1] #= J #<=> Arr2[J-StartIndex2+1] #= I
+        end
+    ;
+        foreach (I in StartIndex1..EndIndex1, J in StartIndex2..EndIndex2, J-StartIndex2 >= 0, J-StartIndex2+1 =< N2)
+            Arr1[I-StartIndex1+1] #= J #=> Arr2[J-StartIndex2+1] #= I
+        end
+    ).
+post_constr(channel_lst(StartIndex,List)) =>
+    Arr = to_array(List),
+    N = len(Arr),
+    EndIndex = StartIndex+N-1,
+    List :: StartIndex..EndIndex,
+    foreach (I in StartIndex..EndIndex, J in StartIndex..EndIndex)
+            Arr[I-StartIndex+1] #= J #<=> Arr[J-StartIndex+1] #= I
+    end.
+post_constr(channel_01(StartIndex,List,VarIndex)) =>     % List are 0/1 vars
+    Arr = to_array(List),
+    N = len(Arr),
+    sum(List) #= 1,
+    EndIndex = StartIndex+N-1,
+    VarIndex :: StartIndex..EndIndex,
+    foreach (I in StartIndex..EndIndex)
+        Arr[I-StartIndex+1] #= 1 #<=> VarIndex #= I
+    end.
+post_constr(element(StartIndex,Index,Args,Val)) =>
+    (StartIndex == 1 -> Index1 = Index; Index1 #= Index-StartIndex+1),
+    element(Index1,Args,Val).
+post_constr(lex(Lists,Rel)) =>
+    xcsp_lex(Lists,Rel).
+post_constr(cardinality(List,Vals,Occurs)) =>
+    xcsp_cardinality(List,Vals,Occurs).
+post_constr(noOverlap(Origs,Lens)) =>
+    construct_boxes(Origs,Lens,Boxes),
+    diffn(Boxes).
+post_constr(regular(Vars,MinI,MaxI,Q,Q0,Fs,Triplets)) =>
+    MinI1 = MinI-1,
+    (MinI == 1 ->
+        S = MaxI,
+        L = Vars
+    ;
+        S = MaxI-MinI1,
+        L = [Var1 : Var in Vars, Var1 #= Var-MinI1]   % input symbols are numbered 1,2,...
+    ),
+    TransMatrix = new_array(Q,S),
+    foreach ({FromState,Input,ToState} in Triplets)
+        Input1 = Input-MinI1,
+        Entry = TransMatrix[FromState,Input1],
+        (var(Entry) ->
+            Entry = ToState
+        ; list(Entry) ->
+            TransMatrix[FromState,Input1] := [ToState|Entry]
+        ;
+            TransMatrix[FromState,Input1] := [ToState,Entry]
+        )
+    end,
+    foreach (Row in 1..Q, Col in 1..S)
+        Entry = TransMatrix[Row,Col],
+        (var(Entry) -> Entry = 0; true)
+    end,
+    regular(L,Q,S,TransMatrix,Q0,Fs).
+post_constr(mdd(Vars,Q,Triplets)) =>    % Q - number of states
+    IsRoot = new_array(Q),                             % IsRoot[I] = 0 if I is not the root
+    Graph = new_array(Q),                              % adjacency representation
+    foreach (I in 1..Q)
+        Graph[I] = []
+    end,
+    foreach ({FromState,Input,ToState} in Triplets)
+        Graph[FromState] := [{Input,ToState}|Graph[FromState]],
+        IsRoot[ToState] = 0
+    end,
+    Root = _,                                          % make Root a non-local var
+    foreach (I in 1..Q)
+        IsRooti = IsRoot[I],
+        (var(IsRooti) -> Root = I; true)
+    end,
+    VarArr = to_array(Vars),
+    N = len(VarArr),
+    Tuple = new_array(N),
+    construct_transition_paths(Graph[Root],1,Graph,Tuple,Tuples,[]),
+    table_in(VarArr,Tuples).
+post_constr(cumulative(Origs,Lens,Ends,Heights,Rel,Operand)) =>
+    (Rel == le ->
+        Limit = Operand
+    ;Rel == lt ->
+        Limit = Operand-1
+    ;
+        xcsp_error("unsupported_cumulative_operator %w\n",Rel)
+    ),
+    (var(Ends) ->
+        true
+    ;
+        foreach ({Orig,Len,End} in zip(Origs,Lens,Ends))
+            End #= Orig+Len
+        end
+    ),
+    cumulative(Origs,Lens,Heights,Limit).
+post_constr(xcsp_circuit(List)) =>
+    N = len(List),
+    List1 = new_array(N),
+    foreach (I in 1..N)
+        List1[I] :: [X+1 : X in fd_dom(List[I])],
+        List1[I] #= List[I]+1
+    end,
+    subcircuit(List1).                                  % xcsp's circuit is the same as MiniZinc's subcircuit
+post_constr(Constr) =>
+    printf("c unpost_constr %w\n",Constr).
+
+%%
+/*
+post_constr(Op1,Rel,Op2) ?=>
+    writeln($post_constr(Op1,Rel,Op2)),fail.
+*/
+post_constr(Op1,gt,Op2) =>
+    Op1 #> Op2.
+post_constr(Op1,ge,Op2) =>
+    Op1 #>= Op2.
+post_constr(Op1,lt,Op2) =>
+    Op1 #< Op2.
+post_constr(Op1,le,Op2) =>
+    Op1 #=< Op2.
+post_constr(Op1,eq,Op2) =>
+    Op1 #= Op2.
+post_constr(Op1,ne,Op2) =>
+    Op1 #!= Op2.
+post_constr(Op1,in,range(LB,UB)) =>
+    Op1 #>= LB,
+    Op1 #=< UB.
+
+%%%
+% supplementary constraints
+nValues(List,T) =>
+    LB = min([fd_min(Var) : Var in List]),
+    UB = max([fd_max(Var) : Var in List]),
+    T #= sum([count(E,List) #>= 1 : E in LB..UB]).
+
+nValuesExcept(List,Val,T) =>
+    LB = min([fd_min(Var) : Var in List]),
+    UB = max([fd_max(Var) : Var in List]),
+    T #= sum([count(E,List) #>= 1 : E in LB..UB, E !== Val]).
+
+allEqual([]) => true.
+allEqual([_]) => true.
+allEqual([X|List@[Y|_]]) =>
+    X #= Y,
+    allEqual(List).
+
+ordered([],_Rel) => true.
+ordered([_],_Rel) => true.
+ordered([X|List@[Y|_]],Rel) =>
+    ordered_pair(X,Y,Rel),
+    ordered(List,Rel).
+
+ordered([],_Lens,_Rel) => true.
+ordered([_],_Lens,_Rel) => true.
+ordered([X|List@[Y|_]],[Len|Lens],Rel) =>
+    ordered_pair($(X+Len),Y,Rel),
+    ordered(List,Lens,Rel).
+
+ordered_pair(X,Y,lt) => X #< Y.
+ordered_pair(X,Y,le) => X #=< Y.
+ordered_pair(X,Y,gt) => X #> Y.
+ordered_pair(X,Y,ge) => X #>= Y.
+
+xcsp_lex([],_Rel) => true.
+xcsp_lex([_],_Rel) => true.
+xcsp_lex([Xs|Lists@[Ys|_]],Rel) =>
+    xcsp_lex_pair(Xs,Ys,Rel),
+    xcsp_lex(Lists,Rel).
+
+xcsp_lex_pair(Xs,Ys,lt) =>
+    xcsp_lex_pair_lt(Xs,Ys,1).
+xcsp_lex_pair(Xs,Ys,le) =>
+    xcsp_lex_pair_le(Xs,Ys,1).
+xcsp_lex_pair(Xs,Ys,gt) =>
+    xcsp_lex_pair_lt(Ys,Xs,1).
+xcsp_lex_pair(Xs,Ys,ge) =>
+    xcsp_lex_pair_le(Ys,Xs,1).
+
+xcsp_lex_pair_lt([X|Xs],[Y|Ys],B) =>
+    B #<=> (X #< Y) #\/ (X #= Y #/\ B1),
+    xcsp_lex_pair_lt(Xs,Ys,B1).
+xcsp_lex_pair_lt([],[],B) => B = 0.
+xcsp_lex_pair_lt([],[_|_],B) => B = 1.
+xcsp_lex_pair_lt([_|_],[],B) => B = 0.
+
+xcsp_lex_pair_le([X|Xs],[Y|Ys],B) =>
+    B #<=> (X #< Y) #\/ (X #= Y #/\ B1),
+    xcsp_lex_pair_le(Xs,Ys,B1).
+xcsp_lex_pair_le([],_,B) => B = 1.
+xcsp_lex_pair_le(_,_,B) => B = 0.
+
+allDistant([],_Rel,_Operand) => true.
+allDistant([_],_Rel,_Operand) => true.
+allDistant([X|List@[Y|_]],Rel,Operand) =>
+    LHS = $abs(X-Y),
+    post_constr(LHS,Rel,Operand),
+    allDistant(List,Rel,Operand).
+
+instantiation([],_) => true.
+instantiation([V|Vs],[Val|Vals]) =>
+    (Val == '*' -> true; V = Val),
+    instantiation(Vs,Vals).
+
+xcsp_cardinality(List,Vals,Occurs) =>
+    N = len(List),
+    (dvar_or_int_list(Occurs) ->
+        LB = sum([fd_min(Occur) : Occur in Occurs]),
+        SumOccurs :: LB..N,
+        SumOccurs #= sum(Occurs),
+        (LB == N, ground(Vals) ->
+            List :: Vals
+        ;
+            true
+        )
+    ;
+        true
+    ),
+    foreach({Val,Occur} in zip(Vals,Occurs))
+        if dvar_or_int(Occur) then
+             sum([B : Var in List, B #<=> (Var #= Val)]) #= Occur
+        else
+            Card :: 0..N,
+            Card #= sum([B : Var in List, B #<=> (Var #= Val)]),
+            From = Occur[1], To = Occur[2],            % Val must be From..To
+            Card #>= From,
+            Card #=< To
+        end
+    end.
+
+%%%%  utilities %%%%
+%%%
+read_int(InStream,'-',Item) =>
+    read_picat_token(InStream,_,Token),                % must be an int
+    Item is -Token.
+read_int(InStream,'+',Item) =>
+    read_picat_token(InStream,_,Token),                % must be an int
+    Item is Token.
+read_int(_InStream,Token,Item) =>
+    Item = Token.
+
+read_next_key_token(InStream,KeyToken) =>
+    read_picat_token(InStream,_, Token),
+    read_next_key_token(InStream,Token,KeyToken).
+
+read_next_key_token(_InStream,end_of_file,KeyToken) => KeyToken = end_of_file.
+read_next_key_token(InStream,'<',KeyToken) =>
+    read_picat_token(InStream,_, Token),
+    (key_token(Token)->
+         KeyToken = Token
+    ;
+         read_next_key_token(InStream,KeyToken)
+    ).
+read_next_key_token(InStream,'</',KeyToken) =>
+    read_picat_token(InStream,_, Token),
+    (key_token(Token)->
+         KeyToken = Token
+    ;
+         read_next_key_token(InStream,KeyToken)
+    ).
+read_next_key_token(InStream,_,KeyToken) =>
+    read_next_key_token(InStream,KeyToken).
+
+key_token(allDifferent) =>  true.
+key_token(allDistant) =>  true.
+key_token(allEqual) =>  true.
+key_token(args) =>  true.
+key_token(array) =>  true.
+key_token(block) =>  true.
+key_token(cardinality) =>  true.
+key_token(channel) =>  true.
+key_token(circuit) =>  true.
+key_token(constraint) =>  true.
+key_token(constraints) =>  true.
+key_token(count) =>  true.
+key_token(cumulative) =>  true.
+key_token(domain) =>  true.
+key_token(element) =>  true.
+key_token(end_of_file) => true.
+key_token(extension) =>  true.
+key_token(grammar) =>  true.
+key_token(group) =>  true.
+key_token(instantiation) =>  true.
+key_token(intension) =>  true.
+key_token(lex) =>  true.
+key_token(maximize) =>  true.
+key_token(maximum) =>  true.
+key_token(mdd) =>  true.
+key_token(minimize) =>  true.
+key_token(minimum) =>  true.
+key_token(nValues) =>  true.
+key_token(noOverlap) =>  true.
+key_token(objectives) =>  true.
+key_token(ordered) =>  true.
+key_token(regular) =>  true.
+key_token(slide) =>  true.
+key_token(sum) =>  true.
+key_token(var) =>  true.
+key_token(variables) =>  true.
+
+%%
+skip_until_1(InStream,Token) =>
+    read_picat_token(InStream,_,CurToken),
+    skip_until_1(InStream,Token,CurToken).
+
+skip_until_1(_InStream,Token,Token) =>  true.
+skip_until_1(InStream,Token,_) => 
+    read_picat_token(InStream,_,CurToken),
+    skip_until_1(InStream,Token,CurToken).
+
+skip_until_2(InStream,Token1,Token2) =>
+    read_picat_token(InStream,_,CurToken),
+    skip_until_2(InStream,Token1,Token2,CurToken).
+
+skip_until_2(InStream,Token1,Token2,Token1) => 
+    read_picat_token(InStream,_,CurToken),
+    (CurToken==Token2 ->
+        true
+    ;
+        skip_until_2(InStream,Token1,Token2,CurToken)
+    ).
+skip_until_2(InStream,Token1,Token2,_) => 
+    read_picat_token(InStream,_,CurToken),
+     skip_until_2(InStream,Token1,Token2,CurToken).
+
+
+%%%
+construct_array([D]) = new_array(D).
+construct_array([D1,D2]) = new_array(D1,D2).
+construct_array([D1,D2,D3]) = new_array(D1,D2,D3).
+construct_array([D1,D2,D3,D4]) = new_array(D1,D2,D3,D4).
+construct_array([D1,D2,D3,D4,D5]) = new_array(D1,D2,D3,D4,D5).
+construct_array([D1,D2,D3,D4,D5,D6]) = new_array(D1,D2,D3,D4,D5,D6).
+construct_array([D1,D2,D3,D4,D5,D6,D7]) = new_array(D1,D2,D3,D4,D5,D6,D7).
+construct_array([D1,D2,D3,D4,D5,D6,D7,D8]) = new_array(D1,D2,D3,D4,D5,D6,D7,D8).
+
+% construct the interval From..To. In Picat, $(From..To) is always a function that returns a list
+construct_range(From,To,Range) =>
+    Range = new_struct('..',2),
+    Range[1] = From,
+    Range[2] = To.
+
+% a n-dimensional box has the form [O1,...,On,L1,...,Ln]
+construct_boxes([],[],Boxes) => Boxes = [].
+construct_boxes([Orig|Origs],[Len|Lens],Boxes) =>
+    (dvar_or_int(Orig) ->
+        Box = [Orig,Len]
+    ;
+        Box = to_list(Orig) ++ to_list(Len)
+    ),
+    Boxes = [Box|BoxesR],
+    construct_boxes(Origs,Lens,BoxesR).
+
+% convert mdd transitions to a set of paths
+construct_transition_paths([],_I,_Graph,_Tuple,Tuples,TuplesR) => Tuples = TuplesR.
+construct_transition_paths([{Symbol,State}|Edges],I,Graph,Tuple,Tuples,TuplesR) =>
+    Tuple[I] := Symbol,
+    OutEdges = Graph[State],
+    (OutEdges == [] ->    % State is the terminal
+        TupleCP = copy_term(Tuple),
+        Tuples = [TupleCP|Tuples1]
+    ;
+        construct_transition_paths(OutEdges,I+1,Graph,Tuple,Tuples,Tuples1)
+    ),
+    construct_transition_paths(Edges,I,Graph,Tuple,Tuples1,TuplesR).
+
+% DVar has the same domain as DVar0
+same_domains(DVar,DVar0) =>
+    fd_min_max(DVar0,Min0,Max0),
+    DVar :: Min0..Max0,
+    Size0 = fd_size(DVar0),
+    if Size0 < Max0-Min0+1 then
+        foreach (Val in Min0..Max0, fd_false(DVar0,Val))
+            bp.fd_set_false(DVar,Val)
+        end
+    end.
+
+same_array_domains(Arr,Arr0), compound(Arr) =>
+    foreach (I in 1..len(Arr))
+        same_array_domains(Arr[I],Arr0[I])
+    end.
+same_array_domains(Arr,Arr0) =>
+    same_domains(Arr,Arr0).
+
+%%% for parsing array attributes
+%
+my_split([],Tokens) => Tokens = [].
+my_split([C|Str],Tokens), white_space(C) =>
+    my_split(Str,Tokens).
+my_split(['.','.'|Str],Tokens) =>
+    Tokens = [".."|TokensR],
+    my_split(Str,TokensR).
+my_split(['['|Str],Tokens) =>
+    Tokens = ["["|TokensR],
+    my_split(Str,TokensR).
+my_split([']'|Str],Tokens) =>
+    Tokens = ["]"|TokensR],
+    my_split(Str,TokensR).
+my_split([C|Str],Tokens) =>
+    Tokens = [Token|TokensR],
+    Token = [C|TokenR],
+    my_extract_token(Str,TokenR,TokensR).
+
+my_extract_token([],Token,Tokens) => Token = [], Tokens = [].
+my_extract_token(['['|Str],Token,Tokens) =>
+    Token = [],
+    Tokens = ["["|TokensR],
+    my_split(Str,TokensR).
+my_extract_token([']'|Str],Token,Tokens) =>
+    Token = [],
+    Tokens = ["]"|TokensR],
+    my_split(Str,TokensR).
+my_extract_token(['.','.'|Str],Token,Tokens) =>
+    Token = [],
+    Tokens = [".."|TokensR],
+    my_split(Str,TokensR).
+my_extract_token([C|Str],Token,Tokens), white_space(C) =>
+    Token = [],
+    my_split(Str,Tokens).
+my_extract_token([C|Str],Token,Tokens) =>
+    Token = [C|TokenR],
+    my_extract_token(Str,TokenR,Tokens).
+
+white_space(' ') => true.
+white_space('\t') => true.
+white_space('\n') => true.
+white_space('\r') => true.
+
+get_array_dims(Arr,Dims), compound(Arr) =>
+    Dims = [len(Arr)|DimsR],
+    get_array_dims(Arr[1],DimsR).
+get_array_dims(_Arr,Dims) => Dims = [].
+
+xcsp_error(FMT,Token) =>
+    printf(stderr,FMT,Token),
+    halt.
+
+dvar_or_int_list([]) => true.
+dvar_or_int_list([X|Xs]) =>
+    dvar_or_int(X),
+    dvar_or_int_list(Xs).
