@@ -1758,11 +1758,8 @@ post_constr(agg_sum(Coes,Args,Rel,Operand)) =>
     post_constr($sum(Sum),Rel,Operand).
 post_constr(agg_sum_unit_coes(Args,Rel,Operand)) =>
     post_constr($sum(Args),Rel,Operand).
-post_constr(agg_count(List,[V],Rel,Operand)) =>
-    post_constr($count(V,List),Rel,Operand).
 post_constr(agg_count(List,Vals,Rel,Operand)) =>
-    Sum = [count(X,Vals) #>= 1 : X in List],
-    post_constr($sum(Sum),Rel,Operand).
+    post_count(List,Vals,[],Rel,Operand).
 post_constr(nValues(List,Rel,Operand)) =>
     N = len(List),
     T :: 0..N,
@@ -1937,6 +1934,15 @@ post_constr(Op1,ne,Op2) =>
 post_constr(Op1,in,range(LB,UB)) =>
     Op1 #>= LB,
     Op1 #=< UB.
+
+post_count([],Vals,Bs,Rel,Operand) =>
+    post_constr($sum(Bs),Rel,Operand).
+post_count([X|Xs],Vals@[Val],Bs,Rel,Operand) =>
+    B #<=> (X #= Val),
+    post_count(Xs,Vals,[B|Bs],Rel,Operand).
+post_count([X|Xs],Vals,Bs,Rel,Operand) =>
+    B #= max([Beq : Val in Vals, Beq #<=> X #= Val]),
+    post_count(Xs,Vals,[B|Bs],Rel,Operand).
 
 %%%
 % supplementary constraints
